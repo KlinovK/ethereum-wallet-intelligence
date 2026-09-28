@@ -37,6 +37,62 @@ class EthereumAddress:
 
 
 @dataclass(frozen=True, slots=True)
+class BlockNumber:
+    """A non-negative Ethereum block number."""
+
+    value: int
+
+    def __post_init__(self) -> None:
+        if type(self.value) is not int:
+            raise DomainValidationError("Block number must be an integer")
+        if self.value < 0:
+            raise DomainValidationError("Block number cannot be negative")
+
+
+def _normalize_hash(value: str, name: str) -> str:
+    if not isinstance(value, str):
+        raise DomainValidationError(f"{name} must be a string")
+    if not value.startswith("0x"):
+        raise DomainValidationError(f"{name} must start with '0x'")
+
+    hexadecimal = value[2:]
+    if len(hexadecimal) != 64:
+        raise DomainValidationError(
+            f"{name} must contain exactly 64 hexadecimal characters after '0x'"
+        )
+    if any(character not in hexdigits for character in hexadecimal):
+        raise DomainValidationError(f"{name} contains non-hexadecimal characters")
+
+    return f"0x{hexadecimal.lower()}"
+
+
+@dataclass(frozen=True, slots=True)
+class BlockHash:
+    """A structurally valid Ethereum block hash in canonical lowercase form."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", _normalize_hash(self.value, "Block hash"))
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionHash:
+    """A structurally valid transaction hash in canonical lowercase form."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", _normalize_hash(self.value, "Transaction hash"))
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
 class Wei:
     """An exact, non-negative amount in Ethereum's smallest denomination."""
 

@@ -6,8 +6,9 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 2 adds the first framework-independent Ethereum domain primitives: `EthereumAddress`,
-`Wei`, and `ChainId`. The service currently exposes one endpoint:
+Phase 3 adds framework-independent models for the block, transaction, and transaction-receipt data
+required by the future indexer, alongside strongly typed Ethereum value objects. The service
+currently exposes one endpoint:
 
 ```text
 GET /health
@@ -28,8 +29,8 @@ layers. The dependency rule is that business and domain code must not depend on 
 infrastructure frameworks such as FastAPI, SQLAlchemy, PostgreSQL clients, or web3.py.
 
 The package contains the composition root, health endpoint, environment-backed settings, and a
-small domain package for the implemented Ethereum value objects. There are no empty application
-or infrastructure layers.
+small domain package for the implemented Ethereum value objects and blockchain data models. There
+are no empty application or infrastructure layers.
 
 ## Requirements
 
