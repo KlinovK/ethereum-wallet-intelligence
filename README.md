@@ -6,7 +6,8 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 1 establishes the project foundation only. The service currently exposes one endpoint:
+Phase 2 adds the first framework-independent Ethereum domain primitives: `EthereumAddress`,
+`Wei`, and `ChainId`. The service currently exposes one endpoint:
 
 ```text
 GET /health
@@ -15,6 +16,10 @@ GET /health
 It returns HTTP 200 with `{"status": "ok"}`. PostgreSQL is available as local development
 infrastructure, but the application intentionally does not connect to it yet.
 
+Address validation is intentionally structural at this stage. Valid addresses are normalized to
+lowercase, but this is not EIP-55 checksum validation. Checksum-aware behavior is deferred until
+an Ethereum adapter introduces a concrete need and an appropriate Ethereum-specific dependency.
+
 ## Architecture
 
 The project is growing as a modular monolith. Clean Architecture and Ports & Adapters patterns
@@ -22,8 +27,9 @@ will be introduced where real use cases create a need for them, rather than as p
 layers. The dependency rule is that business and domain code must not depend on delivery or
 infrastructure frameworks such as FastAPI, SQLAlchemy, PostgreSQL clients, or web3.py.
 
-At this phase, the package contains only the composition root, the health endpoint, and
-environment-backed settings. There are no empty domain, application, or infrastructure layers.
+The package contains the composition root, health endpoint, environment-backed settings, and a
+small domain package for the implemented Ethereum value objects. There are no empty application
+or infrastructure layers.
 
 ## Requirements
 
