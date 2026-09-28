@@ -1,0 +1,28 @@
+services:
+  app:
+    build:
+      context: .
+    environment:
+      EWI_APP_HOST: 0.0.0.0
+      EWI_APP_PORT: 8000
+    ports:
+      - "${APP_PORT:-8000}:8000"
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ethereum_wallet_intelligence}"
+      POSTGRES_USER: "${POSTGRES_USER:-ethereum_wallet_intelligence}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-development-only-password}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
