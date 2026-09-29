@@ -2,7 +2,7 @@ PYTHON ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: install run test lint format type-check check
+.PHONY: install run rpc-smoke test lint format type-check check
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -10,6 +10,9 @@ install:
 
 run:
 	$(BIN)/python -m ethereum_wallet_intelligence
+
+rpc-smoke:
+	$(BIN)/python -m ethereum_wallet_intelligence.rpc_smoke
 
 test:
 	$(BIN)/pytest

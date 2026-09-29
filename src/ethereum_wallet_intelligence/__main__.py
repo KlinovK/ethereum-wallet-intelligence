@@ -8,7 +8,7 @@ from ethereum_wallet_intelligence.main import create_app
 
 def main() -> None:
     """Start the API using validated environment settings."""
-    settings = Settings.from_environment()
+    settings = Settings()
     uvicorn.run(
         create_app(settings),
         host=settings.app_host,

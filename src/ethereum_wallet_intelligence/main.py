@@ -16,7 +16,7 @@ class HealthResponse(BaseModel):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create and configure the ASGI application."""
-    resolved_settings = settings if settings is not None else Settings.from_environment()
+    resolved_settings = settings if settings is not None else Settings()
     app = FastAPI(title=resolved_settings.app_name)
 
     @app.get("/health", response_model=HealthResponse)
