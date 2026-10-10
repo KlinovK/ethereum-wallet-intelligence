@@ -6,31 +6,35 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 4 adds a read-only application port for Ethereum blockchain access and an async web3.py
-adapter for standard JSON-RPC providers. The service currently exposes one endpoint:
+Phase 5 adds production-oriented asynchronous PostgreSQL persistence for Ethereum blocks and
+transactions, using SQLAlchemy 2.x with asyncpg and Alembic migrations.
+
+The service continues to expose the health endpoint:
 
 ```text
 GET /health
 ```
 
-It returns HTTP 200 with `{"status": "ok"}`. PostgreSQL is available as local development
-infrastructure, but the application intentionally does not connect to it yet.
-
-Domain address validation remains intentionally structural: valid addresses are normalized to
-lowercase, but this is not EIP-55 checksum validation. The web3.py adapter derives a checksummed
-form only when making provider calls; checksum-specific behavior does not leak into the domain.
+It returns HTTP 200 with `{"status": "ok"}`. `DATABASE_URL` is optional for the health endpoint and
+unit tests; it is required only when configuring persistence infrastructure or applying migrations.
 
 ## Architecture
 
-The project is growing as a modular monolith. Clean Architecture and Ports & Adapters patterns
-will be introduced where real use cases create a need for them, rather than as placeholder
-layers. The dependency rule is that business and domain code must not depend on delivery or
-infrastructure frameworks such as FastAPI, SQLAlchemy, PostgreSQL clients, or web3.py.
+The project is growing as a modular monolith following Clean Architecture / Ports & Adapters:
+- **Domain Layer** (`domain/`): Pure Python value objects and models (`Block`, `Transaction`, `Wei`, `EthereumAddress`, etc.). No framework dependencies.
+- **Application Layer** (`application/`): Framework-independent repository ports (`BlockRepository`, `TransactionRepository`) and gateway protocols (`BlockchainGateway`), along with domain/application exceptions (`PersistenceError`, `PersistenceConflictError`, `BlockchainProviderError`).
+- **Infrastructure Layer** (`infrastructure/`):
+  - Async Web3.py adapter (`Web3BlockchainGateway`) for Ethereum JSON-RPC.
+  - Async SQLAlchemy 2.x repository adapters (`SQLAlchemyBlockRepository`, `SQLAlchemyTransactionRepository`) and database session helpers.
+  - Explicit mappers (`mappers.py`) translating between SQLAlchemy database rows and domain models.
+- **Delivery / Config** (`main.py`, `config.py`): FastAPI composition root and pydantic-settings configuration.
 
-The package contains the composition root, health endpoint, environment-backed settings, and a
-small domain package for the implemented Ethereum value objects and blockchain data models. There
-is now a framework-independent application `BlockchainGateway` protocol, implemented by the
-infrastructure `Web3BlockchainGateway`. Web3-specific types remain inside infrastructure.
+### Persistence and Transaction Semantics
+
+- **Unit-of-Work and Session Ownership**: Repositories are passed an `AsyncSession`. Repository methods execute operations within the caller-provided transaction context and flush constraints where necessary, but never commit caller-owned transactions. The caller (use case / unit of work) retains full control over commit and rollback boundaries.
+- **Idempotency**: Saving the exact same block or transaction multiple times is idempotent and produces a safe no-op.
+- **Conflict Handling**: If an entity with the same primary identifier (block number or transaction hash) already exists with conflicting immutable blockchain data, the repository raises `PersistenceConflictError` rather than silently overwriting it.
+- **Exact uint256 Range**: Ethereum amounts in wei can reach \(2^{256} - 1\) (78 decimal digits), which exceeds PostgreSQL `BIGINT` (\(2^{63} - 1\)). Wei amounts are stored in PostgreSQL using exact `NUMERIC(78, 0)` columns without floating-point precision loss.
 
 ## Requirements
 
@@ -58,13 +62,31 @@ Then visit <http://127.0.0.1:8000/health>. Runtime settings are read from enviro
 | `EWI_APP_NAME` | `Ethereum Wallet Intelligence` | OpenAPI application title |
 | `EWI_APP_HOST` | `127.0.0.1` | Documented application host setting |
 | `EWI_APP_PORT` | `8000` | Documented application port setting |
+| `DATABASE_URL` | unset | PostgreSQL asyncpg connection URL |
+| `TEST_DATABASE_URL` | unset | Dedicated disposable PostgreSQL integration-test URL |
 | `ETHEREUM_RPC_URL` | unset | HTTP(S) Ethereum JSON-RPC endpoint |
 
 The package bootstrap uses the validated host and port settings when it starts Uvicorn.
-`ETHEREUM_RPC_URL` is optional for the health endpoint and normal unit tests. It is required only
-when constructing the RPC adapter; credentials embedded in it are held as a masked setting and
-must never be committed. Settings are loaded from the repository-root `.env` when commands run
-from the project directory; process environment variables take precedence over `.env` values.
+`DATABASE_URL` and `ETHEREUM_RPC_URL` are optional for the health endpoint and normal unit tests.
+Credentials embedded in URLs are held as masked settings and never exposed in logs or validation
+errors. Settings are loaded from the repository-root `.env` when commands run from the project
+directory; process environment variables take precedence over `.env` values.
+
+### Database Migrations
+
+Apply database migrations using Alembic:
+
+```bash
+make migrate
+```
+
+To rollback the most recent migration:
+
+```bash
+make migrate-down
+```
+
+### Manual RPC Smoke Check
 
 To perform a manual, read-only RPC smoke check, set `ETHEREUM_RPC_URL` in the process environment
 and run:
@@ -73,9 +95,7 @@ and run:
 make rpc-smoke
 ```
 
-The command reads the current block number and that block, then prints the block number, block
-hash, parent hash, and UTC timestamp. It never prints the provider URL and does not use private
-keys or submit transactions. The smoke check is not part of the test suite.
+### Running with Docker Compose
 
 Run the application and PostgreSQL with containers:
 
@@ -84,18 +104,24 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The API is exposed at <http://127.0.0.1:8000> by default. The Compose `APP_PORT` value can change
-the host-side port. PostgreSQL data is stored in a named Docker volume.
+The API is exposed at <http://127.0.0.1:8000> by default. PostgreSQL data is stored in a named Docker volume.
 
 ## Quality commands
 
 ```bash
-make test        # Run the test suite
-make lint        # Run Ruff lint checks
-make format      # Format Python files with Ruff
-make type-check  # Run mypy in strict mode
-make check       # Run lint, type checking, and tests
+make test             # Run unit tests (excluding external integration tests)
+make test-db-up       # Start the disposable PostgreSQL test service
+make test-integration # Start it and run PostgreSQL integration tests
+make test-all         # Run all tests
+make lint             # Run Ruff lint checks
+make format           # Format Python files with Ruff
+make type-check       # Run mypy in strict mode
+make check            # Run lint, type checking, and unit tests
 ```
 
-`pytest-asyncio` is not included because the adapter tests execute coroutines with the standard
-library's `asyncio.run`; no additional async test runtime is currently necessary.
+PostgreSQL integration tests require an explicit `TEST_DATABASE_URL` targeting the Compose
+`postgres-test` service on port 5433 and database `ethereum_wallet_intelligence_test`. They never
+fall back to `DATABASE_URL`. The test service stores its data in temporary memory, and the test
+suite validates the target before migrations or table truncation. Copying `.env.example` provides
+the local development configuration; never point `TEST_DATABASE_URL` at a database containing
+application data.

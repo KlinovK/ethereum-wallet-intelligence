@@ -24,5 +24,22 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  postgres-test:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: ethereum_wallet_intelligence_test
+      POSTGRES_USER: "${POSTGRES_TEST_USER:-ethereum_wallet_intelligence_test}"
+      POSTGRES_PASSWORD: "${POSTGRES_TEST_PASSWORD:-development-only-test-password}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+
 volumes:
   postgres_data:

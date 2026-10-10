@@ -12,6 +12,7 @@ _ENVIRONMENT_VARIABLES = (
     "EWI_APP_HOST",
     "EWI_APP_PORT",
     "ETHEREUM_RPC_URL",
+    "DATABASE_URL",
 )
 
 
@@ -29,6 +30,7 @@ def test_settings_use_defaults() -> None:
     assert settings.app_host == "127.0.0.1"
     assert settings.app_port == 8000
     assert settings.ethereum_rpc_url is None
+    assert settings.database_url is None
 
 
 def test_settings_read_supported_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -36,6 +38,10 @@ def test_settings_read_supported_environment_variables(monkeypatch: pytest.Monke
     monkeypatch.setenv("EWI_APP_HOST", "0.0.0.0")
     monkeypatch.setenv("EWI_APP_PORT", "9000")
     monkeypatch.setenv("ETHEREUM_RPC_URL", "https://ethereum.example/rpc/project-token")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://user:pass@localhost:5432/ethereum_wallet_intelligence",
+    )
 
     settings = Settings()
 
@@ -43,6 +49,10 @@ def test_settings_read_supported_environment_variables(monkeypatch: pytest.Monke
     assert settings.app_host == "0.0.0.0"
     assert settings.app_port == 9000
     assert settings.require_ethereum_rpc_url() == "https://ethereum.example/rpc/project-token"
+    assert (
+        settings.require_database_url()
+        == "postgresql+asyncpg://user:pass@localhost:5432/ethereum_wallet_intelligence"
+    )
 
 
 def test_settings_reject_invalid_port(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,6 +69,13 @@ def test_rpc_url_is_optional_until_rpc_access_is_requested() -> None:
         settings.require_ethereum_rpc_url()
 
 
+def test_database_url_is_optional_until_database_access_is_requested() -> None:
+    settings = Settings()
+
+    with pytest.raises(ValueError, match="DATABASE_URL is required"):
+        settings.require_database_url()
+
+
 def test_settings_reject_invalid_rpc_url_without_exposing_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -72,18 +89,42 @@ def test_settings_reject_invalid_rpc_url_without_exposing_credentials(
     assert "super-secret" not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "sqlite+aiosqlite:///file.db",
+        "https://database.example",
+        "postgresql://user:secret@localhost:5432/db",
+        "invalid-url",
+    ],
+)
+def test_settings_reject_invalid_database_url_without_exposing_credentials(
+    invalid_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", invalid_url)
+
+    with pytest.raises(ValidationError) as error:
+        Settings()
+
+    assert "PostgreSQL asyncpg URL" in str(error.value)
+    assert "secret" not in str(error.value)
+
+
 def test_settings_load_repository_style_dotenv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dotenv_rpc_url = "https://dotenv.ethereum.example/rpc/token"
+    dotenv_db_url = "postgresql+asyncpg://user:pass@localhost:5432/dotenv_db"
     (tmp_path / ".env").write_text(
-        f"ETHEREUM_RPC_URL={dotenv_rpc_url}\nPOSTGRES_DB=ignored-by-settings\n",
+        f"ETHEREUM_RPC_URL={dotenv_rpc_url}\nDATABASE_URL={dotenv_db_url}\n",
         encoding="utf-8",
     )
     settings = Settings()
 
     assert settings.require_ethereum_rpc_url() == dotenv_rpc_url
+    assert settings.require_database_url() == dotenv_db_url
 
 
 def test_environment_variable_overrides_dotenv(
@@ -92,12 +133,16 @@ def test_environment_variable_overrides_dotenv(
 ) -> None:
     dotenv_rpc_url = "https://dotenv.ethereum.example/rpc/token"
     environment_rpc_url = "https://environment.ethereum.example/rpc/token"
+    dotenv_db_url = "postgresql+asyncpg://user:pass@localhost:5432/dotenv_db"
+    environment_db_url = "postgresql+asyncpg://user:pass@localhost:5432/env_db"
     (tmp_path / ".env").write_text(
-        f"ETHEREUM_RPC_URL={dotenv_rpc_url}\n",
+        f"ETHEREUM_RPC_URL={dotenv_rpc_url}\nDATABASE_URL={dotenv_db_url}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ETHEREUM_RPC_URL", environment_rpc_url)
+    monkeypatch.setenv("DATABASE_URL", environment_db_url)
 
     settings = Settings()
 
     assert settings.require_ethereum_rpc_url() == environment_rpc_url
+    assert settings.require_database_url() == environment_db_url

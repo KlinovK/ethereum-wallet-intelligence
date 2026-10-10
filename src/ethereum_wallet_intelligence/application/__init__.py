@@ -5,5 +5,19 @@ from ethereum_wallet_intelligence.application.blockchain import (
     BlockchainProviderError,
     BlockchainResourceNotFoundError,
 )
+from ethereum_wallet_intelligence.application.repositories import (
+    BlockRepository,
+    PersistenceConflictError,
+    PersistenceError,
+    TransactionRepository,
+)
 
-__all__ = ["BlockchainGateway", "BlockchainProviderError", "BlockchainResourceNotFoundError"]
+__all__ = [
+    "BlockRepository",
+    "BlockchainGateway",
+    "BlockchainProviderError",
+    "BlockchainResourceNotFoundError",
+    "PersistenceConflictError",
+    "PersistenceError",
+    "TransactionRepository",
+]

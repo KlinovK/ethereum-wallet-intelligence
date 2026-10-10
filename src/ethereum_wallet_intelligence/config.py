@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     app_host: str = Field(default="127.0.0.1", min_length=1, validation_alias="EWI_APP_HOST")
     app_port: int = Field(default=8000, ge=1, le=65535, validation_alias="EWI_APP_PORT")
     ethereum_rpc_url: SecretStr | None = Field(default=None, validation_alias="ETHEREUM_RPC_URL")
+    database_url: SecretStr | None = Field(default=None, validation_alias="DATABASE_URL")
 
     @field_validator("ethereum_rpc_url")
     @classmethod
@@ -39,8 +40,33 @@ class Settings(BaseSettings):
             raise ValueError("Ethereum RPC URL must be a valid HTTP(S) URL")
         return SecretStr(raw_value)
 
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, value: SecretStr | None) -> SecretStr | None:
+        """Require a PostgreSQL asyncpg endpoint without exposing credentials in error output."""
+        if value is None:
+            return None
+
+        raw_value = value.get_secret_value().strip()
+        parsed = urlsplit(raw_value)
+        if (
+            parsed.scheme not in {"postgresql+asyncpg", "postgres+asyncpg"}
+            or parsed.hostname is None
+        ):
+            raise ValueError(
+                "DATABASE_URL must be a valid PostgreSQL asyncpg URL "
+                "(e.g., postgresql+asyncpg://user:pass@host:port/dbname)"
+            )
+        return SecretStr(raw_value)
+
     def require_ethereum_rpc_url(self) -> str:
         """Return configured RPC URL or fail when an RPC-dependent component needs it."""
         if self.ethereum_rpc_url is None:
             raise ValueError("ETHEREUM_RPC_URL is required for Ethereum RPC access")
         return self.ethereum_rpc_url.get_secret_value()
+
+    def require_database_url(self) -> str:
+        """Return configured database URL or fail when a persistence component needs it."""
+        if self.database_url is None:
+            raise ValueError("DATABASE_URL is required for database persistence")
+        return self.database_url.get_secret_value()
