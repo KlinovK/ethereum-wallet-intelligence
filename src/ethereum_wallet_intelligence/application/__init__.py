@@ -1,5 +1,10 @@
 """Application-facing ports and errors."""
 
+from ethereum_wallet_intelligence.application.block_indexer import (
+    BlockIndexer,
+    BlockIndexingError,
+    InvalidBlockRangeError,
+)
 from ethereum_wallet_intelligence.application.blockchain import (
     BlockBundle,
     BlockchainGateway,
@@ -19,6 +24,8 @@ from ethereum_wallet_intelligence.application.unit_of_work import IndexerUnitOfW
 
 __all__ = [
     "BlockBundle",
+    "BlockIndexer",
+    "BlockIndexingError",
     "BlockRepository",
     "BlockchainGateway",
     "BlockchainProviderError",
@@ -27,6 +34,7 @@ __all__ = [
     "CheckpointRepository",
     "IndexerCheckpoint",
     "IndexerUnitOfWork",
+    "InvalidBlockRangeError",
     "PersistenceConflictError",
     "PersistenceError",
     "TransactionRepository",

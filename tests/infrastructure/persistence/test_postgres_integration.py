@@ -13,6 +13,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ethereum_wallet_intelligence.application import (
+    BlockBundle,
+    BlockchainResourceNotFoundError,
+    BlockIndexer,
+    BlockIndexingError,
     CheckpointConflictError,
     IndexerCheckpoint,
     PersistenceConflictError,
@@ -25,6 +29,7 @@ from ethereum_wallet_intelligence.domain.ethereum import (
     EthereumAddress,
     Transaction,
     TransactionHash,
+    TransactionReceipt,
     Wei,
 )
 from ethereum_wallet_intelligence.infrastructure.persistence.database import create_session_factory
@@ -334,7 +339,7 @@ def _block(number: int, block_hash: str, parent_hash: str) -> Block:
         number=BlockNumber(number),
         hash=BlockHash(block_hash),
         parent_hash=BlockHash(parent_hash),
-        timestamp=datetime(2026, 1, 1, 0, 0, number - 21_000_000, tzinfo=UTC),
+        timestamp=datetime(2026, 1, 1, 0, 0, (number - 21_000_000) % 60, tzinfo=UTC),
     )
 
 
@@ -518,5 +523,190 @@ def test_postgres_checkpoint_migration_constraints() -> None:
                         {**invalid_row, "block_hash": PARENT_HASH_1},
                     )
                 await transaction.rollback()
+
+    _run_with_postgres(_test)
+
+
+class _IndexerGateway:
+    def __init__(self) -> None:
+        self.blocks: dict[BlockNumber, Block] = {}
+        self.bundles: dict[BlockNumber, BlockBundle] = {}
+        self.block_requests: list[BlockNumber] = []
+        self.bundle_requests: list[BlockNumber] = []
+        self.synchronize_bundle_reads = False
+        self._bundle_read_count = 0
+        self._bundle_read_barrier = asyncio.Event()
+
+    async def get_chain_id(self) -> ChainId:
+        return ChainId.ethereum_mainnet()
+
+    async def get_current_block_number(self) -> BlockNumber:
+        raise AssertionError("current height is not used by BlockIndexer")
+
+    async def get_block(self, number: BlockNumber) -> Block:
+        self.block_requests.append(number)
+        try:
+            return self.blocks[number]
+        except KeyError as error:
+            raise BlockchainResourceNotFoundError("test block was not found") from error
+
+    async def get_block_with_transactions(self, number: BlockNumber) -> BlockBundle:
+        self.bundle_requests.append(number)
+        if self.synchronize_bundle_reads:
+            self._bundle_read_count += 1
+            if self._bundle_read_count == 2:
+                self._bundle_read_barrier.set()
+            await self._bundle_read_barrier.wait()
+        try:
+            return self.bundles[number]
+        except KeyError as error:
+            raise BlockchainResourceNotFoundError("test block bundle was not found") from error
+
+    async def get_balance(self, address: EthereumAddress) -> Wei:
+        raise AssertionError("balance is not used by BlockIndexer")
+
+    async def get_transaction(self, transaction_hash: TransactionHash) -> Transaction:
+        raise AssertionError("transaction lookup is not used by BlockIndexer")
+
+    async def get_transaction_receipt(
+        self,
+        transaction_hash: TransactionHash,
+    ) -> TransactionReceipt:
+        raise AssertionError("receipt lookup is not used by BlockIndexer")
+
+
+def test_postgres_block_indexer_range_resume_and_atomic_persistence() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        gateway = _IndexerGateway()
+        anchor = _block(20_999_999, PARENT_HASH_1, "0x" + "01" * 32)
+        block_1 = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        block_2 = _block(21_000_001, BLOCK_HASH_2, BLOCK_HASH_1)
+        transaction_1 = _transaction(TX_HASH_1, block_2.number.value)
+        transaction_2 = _transaction(TX_HASH_2, block_2.number.value)
+        gateway.blocks[anchor.number] = anchor
+        gateway.bundles[block_1.number] = BlockBundle(block_1, ())
+        gateway.bundles[block_2.number] = BlockBundle(
+            block_2,
+            (transaction_1, transaction_2),
+        )
+        indexer = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        )
+
+        indexed = await indexer.index_range(block_1.number, block_2.number)
+        already_complete = await indexer.index_range(block_1.number, block_2.number)
+
+        assert indexed == 2
+        assert already_complete == 0
+        assert gateway.block_requests == [anchor.number]
+        assert gateway.bundle_requests == [block_1.number, block_2.number]
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block_1.number) == block_1
+            assert await reader.blocks.get_by_number(block_2.number) == block_2
+            assert await reader.transactions.get_by_hash(transaction_1.hash) == transaction_1
+            assert await reader.transactions.get_by_hash(transaction_2.hash) == transaction_2
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint == IndexerCheckpoint(
+                chain_id=ChainId.ethereum_mainnet(),
+                start_block_number=block_1.number,
+                next_block_number=BlockNumber(block_2.number.value + 1),
+                expected_parent_hash=block_2.hash,
+            )
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_block_indexer_rejects_existing_data_without_checkpoint() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        orphan = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        async with session_factory() as session, session.begin():
+            await SQLAlchemyBlockRepository(session).save(orphan)
+
+        gateway = _IndexerGateway()
+        with pytest.raises(BlockIndexingError, match="without an indexing checkpoint"):
+            await BlockIndexer(
+                gateway,
+                lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+            ).index_range(orphan.number, orphan.number)
+
+        assert gateway.block_requests == []
+        assert gateway.bundle_requests == []
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_block_indexer_rolls_back_intermediate_transaction_failure() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        gateway = _IndexerGateway()
+        anchor = _block(20_999_999, PARENT_HASH_1, "0x" + "01" * 32)
+        block_1 = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        block_2 = _block(21_000_001, BLOCK_HASH_2, BLOCK_HASH_1)
+        original = _transaction(TX_HASH_1, block_1.number.value)
+        first_new = _transaction(TX_HASH_2, block_2.number.value)
+        conflicting = _transaction(TX_HASH_1, block_2.number.value)
+        gateway.blocks[anchor.number] = anchor
+        gateway.bundles[block_1.number] = BlockBundle(block_1, (original,))
+        gateway.bundles[block_2.number] = BlockBundle(block_2, (first_new, conflicting))
+        indexer = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        )
+
+        assert await indexer.index_range(block_1.number, block_1.number) == 1
+        with pytest.raises(PersistenceConflictError):
+            await indexer.index_range(block_1.number, block_2.number)
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block_2.number) is None
+            assert await reader.transactions.get_by_hash(first_new.hash) is None
+            assert await reader.transactions.get_by_hash(original.hash) == original
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == block_2.number
+            assert checkpoint.expected_parent_hash == block_1.hash
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_block_indexer_concurrent_writers_reject_stale_bundle() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+        block = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(initial)
+            await setup.commit()
+
+        gateway = _IndexerGateway()
+        gateway.synchronize_bundle_reads = True
+        gateway.bundles[block.number] = BlockBundle(block, ())
+        first = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        )
+        second = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        )
+
+        outcomes = await asyncio.gather(
+            first.index_range(block.number, block.number),
+            second.index_range(block.number, block.number),
+            return_exceptions=True,
+        )
+
+        assert sum(outcome == 1 for outcome in outcomes) == 1
+        failures = [outcome for outcome in outcomes if isinstance(outcome, BlockIndexingError)]
+        assert len(failures) == 1
+        assert "changed during RPC retrieval" in str(failures[0])
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block.number) == block
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == BlockNumber(block.number.value + 1)
 
     _run_with_postgres(_test)

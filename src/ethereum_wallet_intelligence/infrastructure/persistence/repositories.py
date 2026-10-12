@@ -43,6 +43,11 @@ class SQLAlchemyBlockRepository:
             return None
         return block_to_domain(model)
 
+    async def has_any(self) -> bool:
+        """Return whether any indexed block exists."""
+        statement = select(BlockModel.number).limit(1)
+        return (await self._session.execute(statement)).scalar_one_or_none() is not None
+
     async def save(self, block: Block) -> None:
         """Save a block idempotently or raise PersistenceConflictError on conflict."""
         existing = await self._session.get(BlockModel, block.number.value)
@@ -96,6 +101,11 @@ class SQLAlchemyTransactionRepository:
         if model is None:
             return None
         return transaction_to_domain(model)
+
+    async def has_any(self) -> bool:
+        """Return whether any indexed transaction exists."""
+        statement = select(TransactionModel.hash).limit(1)
+        return (await self._session.execute(statement)).scalar_one_or_none() is not None
 
     async def save(self, transaction: Transaction) -> None:
         """Save a transaction idempotently or raise PersistenceConflictError on conflict."""

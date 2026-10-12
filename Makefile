@@ -2,7 +2,7 @@ PYTHON ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: install run rpc-smoke test test-unit test-db-up test-integration test-all migrate migrate-down lint format type-check check
+.PHONY: install run rpc-smoke index-blocks test test-unit test-db-up test-integration test-all migrate migrate-down lint format type-check check
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -13,6 +13,9 @@ run:
 
 rpc-smoke:
 	$(BIN)/python -m ethereum_wallet_intelligence.rpc_smoke
+
+index-blocks:
+	$(BIN)/python -m ethereum_wallet_intelligence.index_blocks --start "$(START)" --end "$(END)"
 
 test:
 	$(BIN)/pytest -m "not integration"

@@ -6,9 +6,9 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 6.3 adds durable indexing checkpoints and an application-level Unit of Work on top of the
-asynchronous PostgreSQL persistence introduced in Phase 5. The actual block-indexing service is
-deliberately deferred.
+Phase 6.4 adds the first bounded sequential block-indexing use case. It connects the read-only
+Ethereum gateway to atomic block, transaction, and checkpoint persistence, but runs only through
+an explicit operator command.
 
 The service continues to expose the health endpoint:
 
@@ -51,9 +51,10 @@ so transactions belonging to removed blocks cannot survive a committed rewind. A
 before explicit commit leaves blocks, transactions, and checkpoint unchanged; after restart, work
 resumes from `next_block_number` without a skipped durable height.
 
-Current limitations are intentional: there is no indexer service or CLI yet, no automatic
-reorganization discovery or finality policy, no RPC retry/backoff, and one checkpoint row supports
-one indexing stream per database.
+Current limitations are intentional: there is no continuously running indexer service, automatic
+reorganization rewind, finality policy, or RPC retry/backoff. One checkpoint row supports one
+Ethereum Mainnet indexing stream per database. Parent-hash mismatches halt indexing for operator
+investigation without deleting stored canonical data.
 
 ## Requirements
 
@@ -114,6 +115,30 @@ and run:
 make rpc-smoke
 ```
 
+### Manual Block Indexing
+
+After applying migrations and configuring `DATABASE_URL` and `ETHEREUM_RPC_URL`, explicitly index
+an inclusive Ethereum Mainnet range with:
+
+```bash
+make index-blocks START=19000000 END=19000099
+```
+
+Each invocation must specify both boundaries, may request at most 100 blocks, and never implicitly
+starts from genesis or the provider's latest height. Nothing runs during API startup and there is
+no scheduler.
+
+On a new database, the command anchors the checkpoint from `start - 1` (or the all-zero parent hash
+for genesis) and refuses to initialize if block or transaction data already exists without a
+checkpoint. Subsequent invocations resume from the durable `next_block_number`; attempts to skip a
+height or cross the original start boundary fail explicitly. Already completed requested ranges
+are safe no-ops.
+
+RPC fetching happens before opening the per-block database transaction. The checkpoint is then
+locked and revalidated before the block, all its transactions, and the checkpoint advancement are
+committed together. RPC errors, persistence failures, cancellation, and stale concurrent writers
+cannot leave a partially committed block or advance the checkpoint.
+
 ### Running with Docker Compose
 
 Run the application and PostgreSQL with containers:
@@ -132,6 +157,7 @@ make test             # Run unit tests (excluding external integration tests)
 make test-db-up       # Start the disposable PostgreSQL test service
 make test-integration # Start it and run PostgreSQL integration tests
 make test-all         # Run all tests
+make index-blocks START=... END=... # Explicitly index an inclusive range of at most 100 blocks
 make lint             # Run Ruff lint checks
 make format           # Format Python files with Ruff
 make type-check       # Run mypy in strict mode
