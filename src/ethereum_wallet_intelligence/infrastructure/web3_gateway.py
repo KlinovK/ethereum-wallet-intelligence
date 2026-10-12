@@ -1,6 +1,6 @@
 """Async web3.py adapter for the application blockchain port."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Self, cast
 from urllib.parse import urlsplit
@@ -10,6 +10,7 @@ from web3 import AsyncHTTPProvider, AsyncWeb3
 from web3.exceptions import BlockNotFound, TransactionNotFound
 
 from ethereum_wallet_intelligence.application import (
+    BlockBundle,
     BlockchainProviderError,
     BlockchainResourceNotFoundError,
 )
@@ -17,6 +18,7 @@ from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
     BlockHash,
     BlockNumber,
+    ChainId,
     EthereumAddress,
     Transaction,
     TransactionHash,
@@ -72,6 +74,12 @@ def _as_mapping(value: object, resource_name: str) -> Mapping[str, object]:
     return cast(Mapping[str, object], value)
 
 
+def _as_sequence(value: object, field_name: str) -> Sequence[object]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"Provider field '{field_name}' must be a sequence")
+    return cast(Sequence[object], value)
+
+
 def _map_block(raw_block: object) -> Block:
     data = _as_mapping(raw_block, "block")
     return Block(
@@ -96,6 +104,17 @@ def _map_transaction(raw_transaction: object) -> Transaction:
         gas_limit=_as_integer(data["gas"], "gas"),
         input_data=_as_bytes(data["input"], "input"),
     )
+
+
+def _map_block_bundle(raw_block: object, requested_number: BlockNumber) -> BlockBundle:
+    data = _as_mapping(raw_block, "block")
+    block = _map_block(data)
+    if block.number != requested_number:
+        raise ValueError("Provider returned a different block number than requested")
+
+    raw_transactions = _as_sequence(data["transactions"], "transactions")
+    transactions = tuple(_map_transaction(raw_transaction) for raw_transaction in raw_transactions)
+    return BlockBundle(block=block, transactions=transactions)
 
 
 def _map_transaction_receipt(raw_receipt: object) -> TransactionReceipt:
@@ -125,6 +144,15 @@ class Web3BlockchainGateway:
         endpoint = _validate_rpc_url(rpc_url)
         return cls(AsyncWeb3(AsyncHTTPProvider(endpoint)))
 
+    async def get_chain_id(self) -> ChainId:
+        try:
+            raw_chain_id = await self._web3.eth.chain_id
+            return ChainId(_as_integer(raw_chain_id, "chainId"))
+        except Exception as error:
+            raise BlockchainProviderError(
+                "Ethereum provider failed to return the chain ID"
+            ) from error
+
     async def get_current_block_number(self) -> BlockNumber:
         try:
             raw_number = await self._web3.eth.block_number
@@ -142,6 +170,17 @@ class Web3BlockchainGateway:
             raise BlockchainResourceNotFoundError(f"Block {number.value} was not found") from error
         except Exception as error:
             raise BlockchainProviderError("Ethereum provider failed to return the block") from error
+
+    async def get_block_with_transactions(self, number: BlockNumber) -> BlockBundle:
+        try:
+            raw_block = await self._web3.eth.get_block(number.value, full_transactions=True)
+            return _map_block_bundle(raw_block, number)
+        except BlockNotFound as error:
+            raise BlockchainResourceNotFoundError(f"Block {number.value} was not found") from error
+        except Exception as error:
+            raise BlockchainProviderError(
+                "Ethereum provider failed to return the block with transactions"
+            ) from error
 
     async def get_balance(self, address: EthereumAddress) -> Wei:
         try:
