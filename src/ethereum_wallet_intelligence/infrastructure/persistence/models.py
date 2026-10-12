@@ -2,7 +2,16 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, LargeBinary, Numeric, String
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    LargeBinary,
+    Numeric,
+    SmallInteger,
+    String,
+)
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
@@ -54,7 +63,10 @@ class TransactionModel(Base):
 
     hash: Mapped[str] = mapped_column(String(66), primary_key=True)
     block_number: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("blocks.number"), nullable=False, index=True
+        BigInteger,
+        ForeignKey("blocks.number", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sender: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
     recipient: Mapped[str | None] = mapped_column(String(42), nullable=True, index=True)
@@ -62,3 +74,27 @@ class TransactionModel(Base):
     nonce: Mapped[int] = mapped_column(BigInteger, nullable=False)
     gas_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
     input: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+
+class IndexerCheckpointModel(Base):
+    """Singleton database state for a blockchain indexing stream."""
+
+    __tablename__ = "indexer_checkpoint"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_indexer_checkpoint_singleton"),
+        CheckConstraint("chain_id > 0", name="ck_indexer_checkpoint_chain_id_positive"),
+        CheckConstraint(
+            "start_block_number >= 0",
+            name="ck_indexer_checkpoint_start_non_negative",
+        ),
+        CheckConstraint(
+            "next_block_number >= start_block_number",
+            name="ck_indexer_checkpoint_next_not_before_start",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False, default=1)
+    chain_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    start_block_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    next_block_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expected_parent_hash: Mapped[str] = mapped_column(String(66), nullable=False)

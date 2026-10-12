@@ -12,11 +12,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from ethereum_wallet_intelligence.application import PersistenceConflictError
+from ethereum_wallet_intelligence.application import (
+    CheckpointConflictError,
+    IndexerCheckpoint,
+    PersistenceConflictError,
+)
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
     BlockHash,
     BlockNumber,
+    ChainId,
     EthereumAddress,
     Transaction,
     TransactionHash,
@@ -27,6 +32,9 @@ from ethereum_wallet_intelligence.infrastructure.persistence.mappers import tran
 from ethereum_wallet_intelligence.infrastructure.persistence.repositories import (
     SQLAlchemyBlockRepository,
     SQLAlchemyTransactionRepository,
+)
+from ethereum_wallet_intelligence.infrastructure.persistence.unit_of_work import (
+    SQLAlchemyIndexerUnitOfWork,
 )
 from tests.support.postgres import prepare_test_database
 
@@ -58,7 +66,11 @@ async def _get_postgres_engine(database_url: str) -> AsyncEngine:
 
 async def _truncate_tables(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE transactions, blocks RESTART IDENTITY CASCADE;"))
+        await conn.execute(
+            text(
+                "TRUNCATE TABLE indexer_checkpoint, transactions, blocks RESTART IDENTITY CASCADE;"
+            )
+        )
 
 
 def _run_with_postgres(test_fn: Callable[[AsyncEngine], Awaitable[None]]) -> None:
@@ -300,5 +312,211 @@ def test_postgres_caller_owned_commit_and_rollback_boundaries() -> None:
             assert await block_repo.get_by_number(committed_block.number) == committed_block
             assert await block_repo.get_by_number(rolled_back_block.number) is None
             assert await tx_repo.get_by_hash(rolled_back_tx.hash) is None
+
+    _run_with_postgres(_test)
+
+
+def _checkpoint(
+    *,
+    next_block: int = 21_000_000,
+    expected_parent_hash: str = PARENT_HASH_1,
+) -> IndexerCheckpoint:
+    return IndexerCheckpoint(
+        chain_id=ChainId.ethereum_mainnet(),
+        start_block_number=BlockNumber(21_000_000),
+        next_block_number=BlockNumber(next_block),
+        expected_parent_hash=BlockHash(expected_parent_hash),
+    )
+
+
+def _block(number: int, block_hash: str, parent_hash: str) -> Block:
+    return Block(
+        number=BlockNumber(number),
+        hash=BlockHash(block_hash),
+        parent_hash=BlockHash(parent_hash),
+        timestamp=datetime(2026, 1, 1, 0, 0, number - 21_000_000, tzinfo=UTC),
+    )
+
+
+def _transaction(transaction_hash: str, block_number: int) -> Transaction:
+    return Transaction(
+        hash=TransactionHash(transaction_hash),
+        block_number=BlockNumber(block_number),
+        sender=EthereumAddress(SENDER_1),
+        to=EthereumAddress(RECIPIENT_1),
+        value=Wei(1),
+        nonce=block_number,
+        gas_limit=21_000,
+        input_data=b"",
+    )
+
+
+def test_postgres_unit_of_work_atomically_commits_block_transactions_and_checkpoint() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+        block = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, block.number.value)
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as unit_of_work:
+            await unit_of_work.checkpoints.create(initial)
+            await unit_of_work.blocks.save(block)
+            await unit_of_work.transactions.save(transaction)
+            advanced = await unit_of_work.checkpoints.advance(initial, block)
+            await unit_of_work.commit()
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block.number) == block
+            assert await reader.transactions.get_by_hash(transaction.hash) == transaction
+            assert await reader.checkpoints.get_for_update() == advanced
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_unit_of_work_failure_and_missing_commit_leave_no_partial_state() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+        block = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, block.number.value)
+
+        with pytest.raises(RuntimeError, match="injected failure"):
+            async with SQLAlchemyIndexerUnitOfWork(session_factory) as unit_of_work:
+                await unit_of_work.checkpoints.create(initial)
+                await unit_of_work.blocks.save(block)
+                await unit_of_work.transactions.save(transaction)
+                await unit_of_work.checkpoints.advance(initial, block)
+                raise RuntimeError("injected failure")
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block.number) is None
+            assert await reader.transactions.get_by_hash(transaction.hash) is None
+            assert await reader.checkpoints.get_for_update() is None
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as unit_of_work:
+            await unit_of_work.checkpoints.create(initial)
+            await unit_of_work.blocks.save(block)
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block.number) is None
+            assert await reader.checkpoints.get_for_update() is None
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_concurrent_checkpoint_initialization_and_advance_reject_stale_writer() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+
+        first = SQLAlchemyIndexerUnitOfWork(session_factory)
+        await first.__aenter__()
+        try:
+            await first.checkpoints.create(initial)
+            contender_started = asyncio.Event()
+
+            async def _create_contender() -> None:
+                async with SQLAlchemyIndexerUnitOfWork(session_factory) as contender:
+                    contender_started.set()
+                    await contender.checkpoints.create(initial)
+                    await contender.commit()
+
+            contender_task = asyncio.create_task(_create_contender())
+            await contender_started.wait()
+            await asyncio.sleep(0)
+            await first.commit()
+        finally:
+            await first.__aexit__(None, None, None)
+
+        with pytest.raises(CheckpointConflictError):
+            await contender_task
+
+        block = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.blocks.save(block)
+            await setup.commit()
+
+        first_writer = SQLAlchemyIndexerUnitOfWork(session_factory)
+        await first_writer.__aenter__()
+        try:
+            assert await first_writer.checkpoints.get_for_update() == initial
+            advanced = await first_writer.checkpoints.advance(initial, block)
+            update_started = asyncio.Event()
+
+            async def _update_contender() -> None:
+                async with SQLAlchemyIndexerUnitOfWork(session_factory) as contender:
+                    update_started.set()
+                    await contender.checkpoints.advance(initial, block)
+                    await contender.commit()
+
+            update_task = asyncio.create_task(_update_contender())
+            await update_started.wait()
+            await asyncio.sleep(0)
+            await first_writer.commit()
+        finally:
+            await first_writer.__aexit__(None, None, None)
+
+        with pytest.raises(CheckpointConflictError, match="changed concurrently"):
+            await update_task
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.checkpoints.get_for_update() == advanced
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_rewind_and_on_delete_cascade_are_atomic() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+        block_1 = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        block_2 = _block(21_000_001, BLOCK_HASH_2, BLOCK_HASH_1)
+        transaction_2 = _transaction(TX_HASH_2, block_2.number.value)
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(initial)
+            await setup.blocks.save(block_1)
+            after_1 = await setup.checkpoints.advance(initial, block_1)
+            await setup.blocks.save(block_2)
+            await setup.transactions.save(transaction_2)
+            after_2 = await setup.checkpoints.advance(after_1, block_2)
+            await setup.commit()
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as rewind:
+            assert await rewind.checkpoints.get_for_update() == after_2
+            await rewind.blocks.delete_after(block_1.number)
+            rewound = await rewind.checkpoints.rewind(after_2, block_1)
+            await rewind.commit()
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block_2.number) is None
+            assert await reader.transactions.get_by_hash(transaction_2.hash) is None
+            assert await reader.checkpoints.get_for_update() == rewound == after_1
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_checkpoint_migration_constraints() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        insert_checkpoint = text(
+            "INSERT INTO indexer_checkpoint "
+            "(id, chain_id, start_block_number, next_block_number, expected_parent_hash) "
+            "VALUES (:id, :chain_id, :start, :next, :block_hash)"
+        )
+        invalid_rows = (
+            {"id": 2, "chain_id": 1, "start": 10, "next": 10},
+            {"id": 1, "chain_id": 0, "start": 10, "next": 10},
+            {"id": 1, "chain_id": 1, "start": -1, "next": 10},
+            {"id": 1, "chain_id": 1, "start": 10, "next": 9},
+        )
+        for invalid_row in invalid_rows:
+            async with engine.connect() as connection:
+                transaction = await connection.begin()
+                with pytest.raises(IntegrityError):
+                    await connection.execute(
+                        insert_checkpoint,
+                        {**invalid_row, "block_hash": PARENT_HASH_1},
+                    )
+                await transaction.rollback()
 
     _run_with_postgres(_test)

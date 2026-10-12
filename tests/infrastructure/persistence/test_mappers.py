@@ -3,10 +3,12 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from ethereum_wallet_intelligence.application import IndexerCheckpoint
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
     BlockHash,
     BlockNumber,
+    ChainId,
     EthereumAddress,
     Transaction,
     TransactionHash,
@@ -15,11 +17,14 @@ from ethereum_wallet_intelligence.domain.ethereum import (
 from ethereum_wallet_intelligence.infrastructure.persistence.mappers import (
     block_to_domain,
     block_to_model,
+    checkpoint_to_domain,
+    checkpoint_to_model,
     transaction_to_domain,
     transaction_to_model,
 )
 from ethereum_wallet_intelligence.infrastructure.persistence.models import (
     BlockModel,
+    IndexerCheckpointModel,
     TransactionModel,
 )
 
@@ -29,6 +34,25 @@ TX_HASH = "0x" + "c3" * 32
 SENDER = "0x" + "11" * 20
 RECIPIENT = "0x" + "22" * 20
 UINT256_MAX = 2**256 - 1
+
+
+def test_checkpoint_mapping_roundtrip() -> None:
+    checkpoint = IndexerCheckpoint(
+        chain_id=ChainId.ethereum_mainnet(),
+        start_block_number=BlockNumber(20_000_000),
+        next_block_number=BlockNumber(20_000_123),
+        expected_parent_hash=BlockHash(PARENT_HASH),
+    )
+
+    model = checkpoint_to_model(checkpoint)
+
+    assert isinstance(model, IndexerCheckpointModel)
+    assert model.id == 1
+    assert model.chain_id == 1
+    assert model.start_block_number == 20_000_000
+    assert model.next_block_number == 20_000_123
+    assert model.expected_parent_hash == PARENT_HASH
+    assert checkpoint_to_domain(model) == checkpoint
 
 
 def test_block_mapping_roundtrip() -> None:

@@ -1,10 +1,14 @@
 """SQLAlchemy implementations of application repository ports."""
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ethereum_wallet_intelligence.application import PersistenceConflictError
+from ethereum_wallet_intelligence.application import (
+    CheckpointConflictError,
+    IndexerCheckpoint,
+    PersistenceConflictError,
+)
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
     BlockNumber,
@@ -14,11 +18,14 @@ from ethereum_wallet_intelligence.domain.ethereum import (
 from ethereum_wallet_intelligence.infrastructure.persistence.mappers import (
     block_to_domain,
     block_to_model,
+    checkpoint_to_domain,
+    checkpoint_to_model,
     transaction_to_domain,
     transaction_to_model,
 )
 from ethereum_wallet_intelligence.infrastructure.persistence.models import (
     BlockModel,
+    IndexerCheckpointModel,
     TransactionModel,
 )
 
@@ -69,6 +76,13 @@ class SQLAlchemyBlockRepository:
                 f"A database constraint prevented persisting block {block.number.value}"
             ) from error
 
+    async def delete_after(self, block_number: BlockNumber) -> None:
+        """Delete blocks above a canonical ancestor within the caller's transaction."""
+        await self._session.execute(
+            delete(BlockModel).where(BlockModel.number > block_number.value)
+        )
+        await self._session.flush()
+
 
 class SQLAlchemyTransactionRepository:
     """SQLAlchemy implementation of the TransactionRepository application port."""
@@ -117,3 +131,120 @@ class SQLAlchemyTransactionRepository:
             raise PersistenceConflictError(
                 f"A database constraint prevented persisting transaction {transaction.hash.value}"
             ) from error
+
+
+class SQLAlchemyCheckpointRepository:
+    """PostgreSQL-backed singleton checkpoint with pessimistic write locking."""
+
+    _SINGLETON_ID = 1
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_for_update(self) -> IndexerCheckpoint | None:
+        """Read and lock the checkpoint row until the surrounding transaction ends."""
+        model = await self._get_locked_model()
+        if model is None:
+            return None
+        return checkpoint_to_domain(model)
+
+    async def create(self, checkpoint: IndexerCheckpoint) -> None:
+        """Create the singleton checkpoint, rejecting concurrent initialization."""
+        existing = await self._get_locked_model()
+        if existing is not None:
+            raise CheckpointConflictError("The indexing checkpoint already exists")
+
+        self._session.add(checkpoint_to_model(checkpoint))
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            raise CheckpointConflictError(
+                "A concurrent writer created the indexing checkpoint"
+            ) from error
+
+    async def advance(
+        self,
+        expected: IndexerCheckpoint,
+        block: Block,
+    ) -> IndexerCheckpoint:
+        """Advance exactly one block when the persisted expected state still matches."""
+        model = await self._require_expected_state(expected)
+        if block.number != expected.next_block_number:
+            raise CheckpointConflictError("Checkpoint advancement must index the next block")
+        if block.parent_hash != expected.expected_parent_hash:
+            raise CheckpointConflictError(
+                "Block parent hash does not match the checkpoint expectation"
+            )
+
+        persisted_block = await self._session.get(BlockModel, block.number.value)
+        if persisted_block is None or block_to_domain(persisted_block) != block:
+            raise CheckpointConflictError(
+                "Checkpoint cannot advance until the exact block is persisted"
+            )
+
+        advanced = IndexerCheckpoint(
+            chain_id=expected.chain_id,
+            start_block_number=expected.start_block_number,
+            next_block_number=BlockNumber(block.number.value + 1),
+            expected_parent_hash=block.hash,
+        )
+        model.next_block_number = advanced.next_block_number.value
+        model.expected_parent_hash = advanced.expected_parent_hash.value
+        await self._session.flush()
+        return advanced
+
+    async def rewind(
+        self,
+        expected: IndexerCheckpoint,
+        ancestor: Block,
+    ) -> IndexerCheckpoint:
+        """Move the checkpoint to the block after a retained canonical ancestor."""
+        model = await self._require_expected_state(expected)
+        if ancestor.number.value < expected.start_block_number.value:
+            raise CheckpointConflictError("Checkpoint cannot rewind before its start boundary")
+        if ancestor.number.value >= expected.next_block_number.value:
+            raise CheckpointConflictError("Rewind ancestor must precede the next block")
+
+        persisted_ancestor = await self._session.get(BlockModel, ancestor.number.value)
+        if persisted_ancestor is None or block_to_domain(persisted_ancestor) != ancestor:
+            raise CheckpointConflictError("Rewind ancestor is not the persisted canonical block")
+
+        remaining_descendant = (
+            await self._session.execute(
+                select(BlockModel.number).where(BlockModel.number > ancestor.number.value).limit(1)
+            )
+        ).scalar_one_or_none()
+        if remaining_descendant is not None:
+            raise CheckpointConflictError(
+                "Canonical descendants must be deleted before rewinding the checkpoint"
+            )
+
+        rewound = IndexerCheckpoint(
+            chain_id=expected.chain_id,
+            start_block_number=expected.start_block_number,
+            next_block_number=BlockNumber(ancestor.number.value + 1),
+            expected_parent_hash=ancestor.hash,
+        )
+        model.next_block_number = rewound.next_block_number.value
+        model.expected_parent_hash = rewound.expected_parent_hash.value
+        await self._session.flush()
+        return rewound
+
+    async def _require_expected_state(
+        self,
+        expected: IndexerCheckpoint,
+    ) -> IndexerCheckpointModel:
+        model = await self._get_locked_model()
+        if model is None:
+            raise CheckpointConflictError("The indexing checkpoint does not exist")
+        if checkpoint_to_domain(model) != expected:
+            raise CheckpointConflictError("The indexing checkpoint changed concurrently")
+        return model
+
+    async def _get_locked_model(self) -> IndexerCheckpointModel | None:
+        statement = (
+            select(IndexerCheckpointModel)
+            .where(IndexerCheckpointModel.id == self._SINGLETON_ID)
+            .with_for_update()
+        )
+        return (await self._session.execute(statement)).scalar_one_or_none()

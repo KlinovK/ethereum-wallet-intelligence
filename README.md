@@ -6,8 +6,9 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 5 adds production-oriented asynchronous PostgreSQL persistence for Ethereum blocks and
-transactions, using SQLAlchemy 2.x with asyncpg and Alembic migrations.
+Phase 6.3 adds durable indexing checkpoints and an application-level Unit of Work on top of the
+asynchronous PostgreSQL persistence introduced in Phase 5. The actual block-indexing service is
+deliberately deferred.
 
 The service continues to expose the health endpoint:
 
@@ -22,19 +23,37 @@ unit tests; it is required only when configuring persistence infrastructure or a
 
 The project is growing as a modular monolith following Clean Architecture / Ports & Adapters:
 - **Domain Layer** (`domain/`): Pure Python value objects and models (`Block`, `Transaction`, `Wei`, `EthereumAddress`, etc.). No framework dependencies.
-- **Application Layer** (`application/`): Framework-independent repository ports (`BlockRepository`, `TransactionRepository`) and gateway protocols (`BlockchainGateway`), along with domain/application exceptions (`PersistenceError`, `PersistenceConflictError`, `BlockchainProviderError`).
+- **Application Layer** (`application/`): Framework-independent repository ports (`BlockRepository`, `TransactionRepository`, `CheckpointRepository`), the `IndexerUnitOfWork` port, gateway protocols (`BlockchainGateway`), and application models such as `IndexerCheckpoint`.
 - **Infrastructure Layer** (`infrastructure/`):
   - Async Web3.py adapter (`Web3BlockchainGateway`) for Ethereum JSON-RPC.
-  - Async SQLAlchemy 2.x repository adapters (`SQLAlchemyBlockRepository`, `SQLAlchemyTransactionRepository`) and database session helpers.
+  - Async SQLAlchemy 2.x repository and Unit of Work adapters, plus database session helpers.
   - Explicit mappers (`mappers.py`) translating between SQLAlchemy database rows and domain models.
 - **Delivery / Config** (`main.py`, `config.py`): FastAPI composition root and pydantic-settings configuration.
 
 ### Persistence and Transaction Semantics
 
-- **Unit-of-Work and Session Ownership**: Repositories are passed an `AsyncSession`. Repository methods execute operations within the caller-provided transaction context and flush constraints where necessary, but never commit caller-owned transactions. The caller (use case / unit of work) retains full control over commit and rollback boundaries.
+- **Unit-of-Work and Session Ownership**: All indexing repositories share one `AsyncSession` owned by `SQLAlchemyIndexerUnitOfWork`. Repositories flush constraints but never commit. Durability requires an explicit `commit()`; normal exit without it, exceptions, and cancellation roll back, and the session is always closed.
 - **Idempotency**: Saving the exact same block or transaction multiple times is idempotent and produces a safe no-op.
 - **Conflict Handling**: If an entity with the same primary identifier (block number or transaction hash) already exists with conflicting immutable blockchain data, the repository raises `PersistenceConflictError` rather than silently overwriting it.
 - **Exact uint256 Range**: Ethereum amounts in wei can reach \(2^{256} - 1\) (78 decimal digits), which exceeds PostgreSQL `BIGINT` (\(2^{63} - 1\)). Wei amounts are stored in PostgreSQL using exact `NUMERIC(78, 0)` columns without floating-point precision loss.
+
+### Checkpoint and Recovery Semantics
+
+The singleton checkpoint identifies one chain, the indexing start boundary, the next block that
+must be indexed, and the parent hash that block must reference. Advancement is limited to exactly
+one expected height and requires the exact block to have been persisted in the same transaction.
+PostgreSQL row locking plus full expected-state comparison rejects stale writers and prevents
+silent checkpoint overwrites.
+
+For a known canonical ancestor, a caller can lock the checkpoint, delete later blocks, and rewind
+the checkpoint in one Unit of Work. The transaction-to-block foreign key uses `ON DELETE CASCADE`,
+so transactions belonging to removed blocks cannot survive a committed rewind. A crash or failure
+before explicit commit leaves blocks, transactions, and checkpoint unchanged; after restart, work
+resumes from `next_block_number` without a skipped durable height.
+
+Current limitations are intentional: there is no indexer service or CLI yet, no automatic
+reorganization discovery or finality policy, no RPC retry/backoff, and one checkpoint row supports
+one indexing stream per database.
 
 ## Requirements
 

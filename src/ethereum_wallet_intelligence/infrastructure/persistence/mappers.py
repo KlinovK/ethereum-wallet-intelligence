@@ -1,10 +1,12 @@
 from datetime import UTC
 from decimal import Decimal
 
+from ethereum_wallet_intelligence.application import IndexerCheckpoint
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
     BlockHash,
     BlockNumber,
+    ChainId,
     EthereumAddress,
     Transaction,
     TransactionHash,
@@ -12,8 +14,30 @@ from ethereum_wallet_intelligence.domain.ethereum import (
 )
 from ethereum_wallet_intelligence.infrastructure.persistence.models import (
     BlockModel,
+    IndexerCheckpointModel,
     TransactionModel,
 )
+
+
+def checkpoint_to_domain(model: IndexerCheckpointModel) -> IndexerCheckpoint:
+    """Map the singleton checkpoint row to its application model."""
+    return IndexerCheckpoint(
+        chain_id=ChainId(model.chain_id),
+        start_block_number=BlockNumber(model.start_block_number),
+        next_block_number=BlockNumber(model.next_block_number),
+        expected_parent_hash=BlockHash(model.expected_parent_hash),
+    )
+
+
+def checkpoint_to_model(checkpoint: IndexerCheckpoint) -> IndexerCheckpointModel:
+    """Map an application checkpoint to the singleton database row."""
+    return IndexerCheckpointModel(
+        id=1,
+        chain_id=checkpoint.chain_id.value,
+        start_block_number=checkpoint.start_block_number.value,
+        next_block_number=checkpoint.next_block_number.value,
+        expected_parent_hash=checkpoint.expected_parent_hash.value,
+    )
 
 
 def block_to_domain(model: BlockModel) -> Block:
