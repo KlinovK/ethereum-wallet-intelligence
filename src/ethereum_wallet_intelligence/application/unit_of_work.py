@@ -6,8 +6,17 @@ from typing import Protocol, Self
 from ethereum_wallet_intelligence.application.repositories import (
     BlockRepository,
     CheckpointRepository,
+    PersistenceError,
     TransactionRepository,
 )
+
+
+class CommitOutcomeUnknownError(RuntimeError):
+    """Raised when a commit may have succeeded but its acknowledgement was lost."""
+
+
+class UnitOfWorkCleanupError(PersistenceError):
+    """Raised when a Unit of Work cannot confirm safe session disposal."""
 
 
 class IndexerUnitOfWork(Protocol):

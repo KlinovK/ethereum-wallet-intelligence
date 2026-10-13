@@ -1,6 +1,6 @@
 """SQLAlchemy implementations of application repository ports."""
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,11 @@ class SQLAlchemyBlockRepository:
         """Return whether any indexed block exists."""
         statement = select(BlockModel.number).limit(1)
         return (await self._session.execute(statement)).scalar_one_or_none() is not None
+
+    async def get_highest_number(self) -> BlockNumber | None:
+        """Return the highest persisted block number, if any."""
+        highest = await self._session.scalar(select(func.max(BlockModel.number)))
+        return BlockNumber(highest) if highest is not None else None
 
     async def save(self, block: Block) -> None:
         """Save a block idempotently or raise PersistenceConflictError on conflict."""
@@ -106,6 +111,19 @@ class SQLAlchemyTransactionRepository:
         """Return whether any indexed transaction exists."""
         statement = select(TransactionModel.hash).limit(1)
         return (await self._session.execute(statement)).scalar_one_or_none() is not None
+
+    async def get_by_block_number(
+        self,
+        block_number: BlockNumber,
+    ) -> tuple[Transaction, ...]:
+        """Return all persisted transactions for a block in deterministic hash order."""
+        statement = (
+            select(TransactionModel)
+            .where(TransactionModel.block_number == block_number.value)
+            .order_by(TransactionModel.hash)
+        )
+        models = (await self._session.scalars(statement)).all()
+        return tuple(transaction_to_domain(model) for model in models)
 
     async def save(self, transaction: Transaction) -> None:
         """Save a transaction idempotently or raise PersistenceConflictError on conflict."""

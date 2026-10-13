@@ -5,14 +5,23 @@ from datetime import UTC, datetime
 from typing import Self, cast
 from urllib.parse import urlsplit
 
+from aiohttp import ClientConnectionError, ClientResponseError
 from eth_typing import HexStr
 from web3 import AsyncHTTPProvider, AsyncWeb3
-from web3.exceptions import BlockNotFound, TransactionNotFound
+from web3.exceptions import (
+    BlockNotFound,
+    ProviderConnectionError,
+    RequestTimedOut,
+    TransactionNotFound,
+)
 
 from ethereum_wallet_intelligence.application import (
     BlockBundle,
     BlockchainProviderError,
     BlockchainResourceNotFoundError,
+    InvalidBlockchainResponseError,
+    PermanentBlockchainProviderError,
+    TransientBlockchainProviderError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
@@ -26,6 +35,11 @@ from ethereum_wallet_intelligence.domain.ethereum import (
     Wei,
 )
 
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+_MIN_REQUEST_TIMEOUT_SECONDS = 0.1
+_MAX_REQUEST_TIMEOUT_SECONDS = 60.0
+_INVALID_RESPONSE_ERRORS = (KeyError, TypeError, ValueError, OverflowError, OSError)
+
 
 def _validate_rpc_url(rpc_url: str) -> str:
     sanitized_url = rpc_url.strip()
@@ -33,6 +47,33 @@ def _validate_rpc_url(rpc_url: str) -> str:
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
         raise ValueError("Ethereum RPC URL must be a valid HTTP(S) URL")
     return sanitized_url
+
+
+def _validate_request_timeout(request_timeout_seconds: float) -> float:
+    if type(request_timeout_seconds) not in {int, float}:
+        raise ValueError("Ethereum RPC request timeout must be a number")
+    timeout = float(request_timeout_seconds)
+    if not _MIN_REQUEST_TIMEOUT_SECONDS <= timeout <= _MAX_REQUEST_TIMEOUT_SECONDS:
+        raise ValueError("Ethereum RPC request timeout must be between 0.1 and 60 seconds")
+    return timeout
+
+
+def _provider_error(error: Exception, operation: str) -> BlockchainProviderError:
+    message = f"Ethereum provider failed to {operation}"
+    if isinstance(error, ClientResponseError):
+        if error.status == 429 or 500 <= error.status <= 599:
+            return TransientBlockchainProviderError(f"{message} (HTTP {error.status})")
+        return PermanentBlockchainProviderError(f"{message} (HTTP {error.status})")
+    if isinstance(
+        error,
+        (ClientConnectionError, ProviderConnectionError, RequestTimedOut, TimeoutError),
+    ):
+        return TransientBlockchainProviderError(message)
+    return PermanentBlockchainProviderError(message)
+
+
+def _invalid_response_error(resource: str) -> InvalidBlockchainResponseError:
+    return InvalidBlockchainResponseError(f"Ethereum provider returned invalid {resource} data")
 
 
 def _as_integer(value: object, field_name: str) -> int:
@@ -139,82 +180,127 @@ class Web3BlockchainGateway:
         self._web3 = web3
 
     @classmethod
-    def from_rpc_url(cls, rpc_url: str) -> Self:
+    def from_rpc_url(
+        cls,
+        rpc_url: str,
+        *,
+        request_timeout_seconds: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ) -> Self:
         """Construct the adapter from a validated HTTP(S) JSON-RPC endpoint."""
         endpoint = _validate_rpc_url(rpc_url)
-        return cls(AsyncWeb3(AsyncHTTPProvider(endpoint)))
+        timeout = _validate_request_timeout(request_timeout_seconds)
+        provider = AsyncHTTPProvider(
+            endpoint,
+            request_kwargs={"timeout": timeout},
+            exception_retry_configuration=None,
+        )
+        return cls(AsyncWeb3(provider))
 
     async def get_chain_id(self) -> ChainId:
+        translated_error: BlockchainProviderError
         try:
             raw_chain_id = await self._web3.eth.chain_id
-            return ChainId(_as_integer(raw_chain_id, "chainId"))
         except Exception as error:
-            raise BlockchainProviderError(
-                "Ethereum provider failed to return the chain ID"
-            ) from error
+            translated_error = _provider_error(error, "return the chain ID")
+        else:
+            try:
+                return ChainId(_as_integer(raw_chain_id, "chainId"))
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("chain ID")
+        raise translated_error
 
     async def get_current_block_number(self) -> BlockNumber:
+        translated_error: BlockchainProviderError
         try:
             raw_number = await self._web3.eth.block_number
-            return BlockNumber(_as_integer(raw_number, "blockNumber"))
         except Exception as error:
-            raise BlockchainProviderError(
-                "Ethereum provider failed to return the current block number"
-            ) from error
+            translated_error = _provider_error(error, "return the current block number")
+        else:
+            try:
+                return BlockNumber(_as_integer(raw_number, "blockNumber"))
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("block number")
+        raise translated_error
 
     async def get_block(self, number: BlockNumber) -> Block:
+        translated_error: BlockchainProviderError | BlockchainResourceNotFoundError
         try:
             raw_block = await self._web3.eth.get_block(number.value)
-            return _map_block(raw_block)
-        except BlockNotFound as error:
-            raise BlockchainResourceNotFoundError(f"Block {number.value} was not found") from error
+        except BlockNotFound:
+            translated_error = BlockchainResourceNotFoundError(
+                f"Block {number.value} was not found"
+            )
         except Exception as error:
-            raise BlockchainProviderError("Ethereum provider failed to return the block") from error
+            translated_error = _provider_error(error, "return the block")
+        else:
+            try:
+                return _map_block(raw_block)
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("block")
+        raise translated_error
 
     async def get_block_with_transactions(self, number: BlockNumber) -> BlockBundle:
+        translated_error: BlockchainProviderError | BlockchainResourceNotFoundError
         try:
             raw_block = await self._web3.eth.get_block(number.value, full_transactions=True)
-            return _map_block_bundle(raw_block, number)
-        except BlockNotFound as error:
-            raise BlockchainResourceNotFoundError(f"Block {number.value} was not found") from error
+        except BlockNotFound:
+            translated_error = BlockchainResourceNotFoundError(
+                f"Block {number.value} was not found"
+            )
         except Exception as error:
-            raise BlockchainProviderError(
-                "Ethereum provider failed to return the block with transactions"
-            ) from error
+            translated_error = _provider_error(error, "return the block with transactions")
+        else:
+            try:
+                return _map_block_bundle(raw_block, number)
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("block with transactions")
+        raise translated_error
 
     async def get_balance(self, address: EthereumAddress) -> Wei:
+        translated_error: BlockchainProviderError
         try:
             checksum_address = self._web3.to_checksum_address(address.value)
             raw_balance = await self._web3.eth.get_balance(checksum_address)
-            return Wei(_as_integer(raw_balance, "balance"))
         except Exception as error:
-            raise BlockchainProviderError(
-                "Ethereum provider failed to return the balance"
-            ) from error
+            translated_error = _provider_error(error, "return the balance")
+        else:
+            try:
+                return Wei(_as_integer(raw_balance, "balance"))
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("balance")
+        raise translated_error
 
     async def get_transaction(self, transaction_hash: TransactionHash) -> Transaction:
+        translated_error: BlockchainProviderError | BlockchainResourceNotFoundError
         try:
             raw_transaction = await self._web3.eth.get_transaction(HexStr(transaction_hash.value))
-            return _map_transaction(raw_transaction)
-        except TransactionNotFound as error:
-            raise BlockchainResourceNotFoundError("Transaction was not found") from error
+        except TransactionNotFound:
+            translated_error = BlockchainResourceNotFoundError("Transaction was not found")
         except Exception as error:
-            raise BlockchainProviderError(
-                "Ethereum provider failed to return the transaction"
-            ) from error
+            translated_error = _provider_error(error, "return the transaction")
+        else:
+            try:
+                return _map_transaction(raw_transaction)
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("transaction")
+        raise translated_error
 
     async def get_transaction_receipt(
         self,
         transaction_hash: TransactionHash,
     ) -> TransactionReceipt:
+        translated_error: BlockchainProviderError | BlockchainResourceNotFoundError
         try:
             raw_receipt = await self._web3.eth.get_transaction_receipt(
                 HexStr(transaction_hash.value)
             )
-            return _map_transaction_receipt(raw_receipt)
-        except TransactionNotFound as error:
-            raise BlockchainResourceNotFoundError("Transaction receipt was not found") from error
+        except TransactionNotFound:
+            translated_error = BlockchainResourceNotFoundError("Transaction receipt was not found")
         except Exception as error:
-            raise BlockchainProviderError(
-                "Ethereum provider failed to return the transaction receipt"
-            ) from error
+            translated_error = _provider_error(error, "return the transaction receipt")
+        else:
+            try:
+                return _map_transaction_receipt(raw_receipt)
+            except _INVALID_RESPONSE_ERRORS:
+                translated_error = _invalid_response_error("transaction receipt")
+        raise translated_error

@@ -1,12 +1,14 @@
 """Tests for the async web3.py blockchain adapter."""
 
 import asyncio
+import traceback
 from collections.abc import Coroutine
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from aiohttp import ClientResponseError
 from hexbytes import HexBytes
 from web3 import AsyncHTTPProvider, AsyncWeb3
 from web3.exceptions import BlockNotFound, ProviderConnectionError, TransactionNotFound
@@ -16,6 +18,9 @@ from ethereum_wallet_intelligence.application import (
     BlockchainGateway,
     BlockchainProviderError,
     BlockchainResourceNotFoundError,
+    InvalidBlockchainResponseError,
+    PermanentBlockchainProviderError,
+    TransientBlockchainProviderError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
     BlockHash,
@@ -36,9 +41,17 @@ RECIPIENT = "0x2222222222222222222222222222222222222222"
 
 
 async def _resolve(value: object) -> object:
-    if isinstance(value, Exception):
+    if isinstance(value, BaseException):
         raise value
     return value
+
+
+def _assert_sanitized_exception(error: BaseException, secret: str | None = None) -> None:
+    rendered = "".join(traceback.TracebackException.from_exception(error).format(chain=True))
+    if secret is not None:
+        assert secret not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 class StubAsyncEth:
@@ -243,8 +256,8 @@ def test_rejects_duplicate_transaction_hashes_in_block_bundle() -> None:
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_block_with_transactions(BlockNumber(20_000_000)))
 
-    assert isinstance(error.value.__cause__, ValueError)
-    assert "duplicate transaction hashes" in str(error.value.__cause__)
+    assert isinstance(error.value, InvalidBlockchainResponseError)
+    _assert_sanitized_exception(error.value)
 
 
 def test_rejects_returned_block_number_different_from_request() -> None:
@@ -254,8 +267,8 @@ def test_rejects_returned_block_number_different_from_request() -> None:
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_block_with_transactions(BlockNumber(19_999_999)))
 
-    assert isinstance(error.value.__cause__, ValueError)
-    assert "different block number" in str(error.value.__cause__)
+    assert isinstance(error.value, InvalidBlockchainResponseError)
+    _assert_sanitized_exception(error.value)
 
 
 def test_rejects_transaction_associated_with_different_block() -> None:
@@ -266,8 +279,8 @@ def test_rejects_transaction_associated_with_different_block() -> None:
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_block_with_transactions(BlockNumber(20_000_000)))
 
-    assert isinstance(error.value.__cause__, ValueError)
-    assert "different block" in str(error.value.__cause__)
+    assert isinstance(error.value, InvalidBlockchainResponseError)
+    _assert_sanitized_exception(error.value)
 
 
 @pytest.mark.parametrize(
@@ -298,7 +311,8 @@ def test_rejects_block_payload_without_transactions_field() -> None:
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_block_with_transactions(BlockNumber(20_000_000)))
 
-    assert isinstance(error.value.__cause__, KeyError)
+    assert isinstance(error.value, InvalidBlockchainResponseError)
+    _assert_sanitized_exception(error.value)
 
 
 def test_translates_full_block_provider_failure_without_exposing_endpoint() -> None:
@@ -312,8 +326,7 @@ def test_translates_full_block_provider_failure_without_exposing_endpoint() -> N
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_block_with_transactions(BlockNumber(20_000_000)))
 
-    assert "super-secret" not in str(error.value)
-    assert error.value.__cause__ is provider_error
+    _assert_sanitized_exception(error.value, "super-secret")
 
 
 def test_translates_full_block_not_found() -> None:
@@ -336,8 +349,7 @@ def test_translates_chain_id_provider_failure_without_exposing_endpoint() -> Non
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_chain_id())
 
-    assert "super-secret" not in str(error.value)
-    assert error.value.__cause__ is provider_error
+    _assert_sanitized_exception(error.value, "super-secret")
 
 
 def test_rejects_invalid_chain_id_payload() -> None:
@@ -348,7 +360,8 @@ def test_rejects_invalid_chain_id_payload() -> None:
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_chain_id())
 
-    assert isinstance(error.value.__cause__, ValueError)
+    assert isinstance(error.value, InvalidBlockchainResponseError)
+    _assert_sanitized_exception(error.value)
 
 
 def test_maps_eth_balance() -> None:
@@ -429,10 +442,10 @@ def test_translates_malformed_provider_data() -> None:
     }
     gateway = make_gateway(eth)
 
-    with pytest.raises(BlockchainProviderError, match="failed to return") as error:
+    with pytest.raises(InvalidBlockchainResponseError, match="invalid") as error:
         asyncio.run(gateway.get_transaction_receipt(TransactionHash(TRANSACTION_HASH)))
 
-    assert isinstance(error.value.__cause__, ValueError)
+    _assert_sanitized_exception(error.value)
 
 
 def test_translates_block_not_found() -> None:
@@ -443,7 +456,7 @@ def test_translates_block_not_found() -> None:
     with pytest.raises(BlockchainResourceNotFoundError, match="Block 42 was not found") as error:
         asyncio.run(gateway.get_block(BlockNumber(42)))
 
-    assert isinstance(error.value.__cause__, BlockNotFound)
+    _assert_sanitized_exception(error.value)
 
 
 def test_translates_transaction_not_found() -> None:
@@ -466,8 +479,92 @@ def test_translates_provider_failure_without_exposing_endpoint() -> None:
     with pytest.raises(BlockchainProviderError) as error:
         asyncio.run(gateway.get_current_block_number())
 
-    assert "super-secret" not in str(error.value)
-    assert error.value.__cause__ is provider_error
+    _assert_sanitized_exception(error.value, "super-secret")
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_classifies_rate_limit_and_server_failures_as_transient(status: int) -> None:
+    eth = StubAsyncEth()
+    provider_error = ClientResponseError(
+        cast(Any, None),
+        (),
+        status=status,
+        message="https://user:super-secret@ethereum.example",
+    )
+    eth.block_number_result = provider_error
+
+    with pytest.raises(TransientBlockchainProviderError) as error:
+        asyncio.run(make_gateway(eth).get_current_block_number())
+
+    assert f"HTTP {status}" in str(error.value)
+    _assert_sanitized_exception(error.value, "super-secret")
+
+
+def test_classifies_timeout_as_transient() -> None:
+    eth = StubAsyncEth()
+    provider_error = TimeoutError("https://user:super-secret@ethereum.example timed out")
+    eth.block_number_result = provider_error
+
+    with pytest.raises(TransientBlockchainProviderError) as error:
+        asyncio.run(make_gateway(eth).get_current_block_number())
+
+    _assert_sanitized_exception(error.value, "super-secret")
+
+
+def test_classifies_non_retryable_http_failure_as_permanent() -> None:
+    eth = StubAsyncEth()
+    provider_error = ClientResponseError(
+        cast(Any, None),
+        (),
+        status=401,
+        message="https://user:super-secret@ethereum.example",
+    )
+    eth.block_number_result = provider_error
+
+    with pytest.raises(PermanentBlockchainProviderError) as error:
+        asyncio.run(make_gateway(eth).get_current_block_number())
+
+    assert "HTTP 401" in str(error.value)
+    _assert_sanitized_exception(error.value, "super-secret")
+
+
+def test_malformed_response_is_permanent_and_explicitly_non_retryable() -> None:
+    eth = StubAsyncEth()
+    eth.block_number_result = "not-an-integer"
+
+    with pytest.raises(InvalidBlockchainResponseError) as error:
+        asyncio.run(make_gateway(eth).get_current_block_number())
+
+    assert isinstance(error.value, PermanentBlockchainProviderError)
+    _assert_sanitized_exception(error.value)
+
+
+def test_provider_cancellation_is_not_translated() -> None:
+    eth = StubAsyncEth()
+    eth.block_number_result = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(make_gateway(eth).get_current_block_number())
+
+
+def test_adapter_configures_bounded_timeout_and_disables_provider_retries() -> None:
+    gateway = Web3BlockchainGateway.from_rpc_url(
+        "https://user:super-secret@ethereum.example",
+        request_timeout_seconds=7,
+    )
+    provider = gateway._web3.provider
+
+    assert provider.get_request_kwargs()["timeout"] == 7
+    assert provider.exception_retry_configuration is None
+
+
+@pytest.mark.parametrize("timeout", [0, 60.1])
+def test_adapter_rejects_unbounded_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError, match=r"between 0.1 and 60"):
+        Web3BlockchainGateway.from_rpc_url(
+            "https://ethereum.example",
+            request_timeout_seconds=timeout,
+        )
 
 
 @pytest.mark.parametrize("rpc_url", ["", "ftp://ethereum.example", "not-a-url"])

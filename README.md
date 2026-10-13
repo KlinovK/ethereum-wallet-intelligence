@@ -6,9 +6,8 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 6.4 adds the first bounded sequential block-indexing use case. It connects the read-only
-Ethereum gateway to atomic block, transaction, and checkpoint persistence, but runs only through
-an explicit operator command.
+Phase 6.5 hardens the bounded sequential block indexer against transient RPC failures and uncertain
+database commit acknowledgements. Indexing still runs only through an explicit operator command.
 
 The service continues to expose the health endpoint:
 
@@ -52,7 +51,7 @@ before explicit commit leaves blocks, transactions, and checkpoint unchanged; af
 resumes from `next_block_number` without a skipped durable height.
 
 Current limitations are intentional: there is no continuously running indexer service, automatic
-reorganization rewind, finality policy, or RPC retry/backoff. One checkpoint row supports one
+reorganization rewind, finality policy, or database-write retry. One checkpoint row supports one
 Ethereum Mainnet indexing stream per database. Parent-hash mismatches halt indexing for operator
 investigation without deleting stored canonical data.
 
@@ -85,6 +84,11 @@ Then visit <http://127.0.0.1:8000/health>. Runtime settings are read from enviro
 | `DATABASE_URL` | unset | PostgreSQL asyncpg connection URL |
 | `TEST_DATABASE_URL` | unset | Dedicated disposable PostgreSQL integration-test URL |
 | `ETHEREUM_RPC_URL` | unset | HTTP(S) Ethereum JSON-RPC endpoint |
+| `ETHEREUM_RPC_TIMEOUT_SECONDS` | `10` | Per-request RPC timeout (`0.1`–`60`) |
+| `ETHEREUM_RPC_MAX_ATTEMPTS` | `3` | Total attempts for transient RPC reads (`1`–`5`) |
+| `ETHEREUM_RPC_RETRY_BASE_DELAY_SECONDS` | `0.25` | Initial retry delay (`0`–`5`) |
+| `ETHEREUM_RPC_RETRY_MAX_DELAY_SECONDS` | `2` | Retry-delay cap (`0`–`30`) |
+| `ETHEREUM_RPC_RETRY_JITTER_RATIO` | `0.2` | Randomized delay fraction (`0`–`1`) |
 
 The package bootstrap uses the validated host and port settings when it starts Uvicorn.
 `DATABASE_URL` and `ETHEREUM_RPC_URL` are optional for the health endpoint and normal unit tests.
@@ -138,6 +142,38 @@ RPC fetching happens before opening the per-block database transaction. The chec
 locked and revalidated before the block, all its transactions, and the checkpoint advancement are
 committed together. RPC errors, persistence failures, cancellation, and stale concurrent writers
 cannot leave a partially committed block or advance the checkpoint.
+
+### Indexer failure recovery
+
+RPC connection failures, request timeouts, HTTP 429 responses, and HTTP 5xx responses are treated
+as transient read failures. The indexer retries only these failures using bounded exponential
+backoff with jitter. Invalid or incomplete RPC data, not-found responses, other provider failures,
+domain validation errors, reorganization signals, and application errors fail immediately. The
+Web3 provider's own retry loop is disabled so the configured attempt bound remains authoritative.
+
+Each block still has exactly one database transaction and database writes are never blindly
+retried. If `commit()` raises after its outcome may have become ambiguous, the failed session is
+rolled back and closed, or its connection is explicitly invalidated if normal cleanup fails. A new
+Unit of Work reads durable state only after that disposal is confirmed. The operation is accepted
+as successful only when the checkpoint made the exact expected transition and the exact block plus
+complete transaction set are present. An unchanged checkpoint with no partial bundle is reported
+as not durable; partial, advanced, or otherwise inconsistent state fails closed. If neither normal
+cleanup nor invalidation can confirm disposal, reconciliation does not begin.
+
+Before fetching a block bundle, a read-only startup audit verifies the checkpoint's persisted tip,
+expected parent hash, and absence of blocks beyond the checkpoint. It also continues to reject
+block or transaction data without a checkpoint. These checks do not repair or delete data.
+
+CLI failures include stable categories and exit codes: transient RPC exhaustion (`3`), durable
+state consistency (`4`), commit reconciliation (`5`), and permanent RPC failure (`6`); argument
+errors retain argparse's exit code (`2`). For a proven non-durable commit, rerun the identical
+range. For consistency, reconciliation, or parent-hash failures, stop indexing, preserve the
+database, and investigate the checkpoint and canonical chain before retrying. Credentials and
+connection strings are never included in indexer log fields or translated error messages. Provider
+and commit failures are translated after leaving the raw exception handler, so standard Python
+tracebacks do not retain the credential-bearing infrastructure exception as a cause or context.
+Custom traceback or telemetry renderers must still avoid independently capturing and retaining raw
+provider or database exceptions before this translation boundary.
 
 ### Running with Docker Compose
 

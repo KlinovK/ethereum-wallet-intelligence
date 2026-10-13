@@ -5,12 +5,19 @@ These tests run against a real PostgreSQL instance when configured and reachable
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from ethereum_wallet_intelligence.application import (
     BlockBundle,
@@ -18,7 +25,9 @@ from ethereum_wallet_intelligence.application import (
     BlockIndexer,
     BlockIndexingError,
     CheckpointConflictError,
+    CommitNotDurableError,
     IndexerCheckpoint,
+    IndexingConsistencyError,
     PersistenceConflictError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
@@ -575,6 +584,55 @@ class _IndexerGateway:
         raise AssertionError("receipt lookup is not used by BlockIndexer")
 
 
+@dataclass(slots=True)
+class _CommitFaultPlan:
+    mode: str
+    commit_calls: int = 0
+    rollback_calls: int = 0
+    faulted_session_id: int | None = None
+    closed_session_ids: set[int] = field(default_factory=set)
+
+
+class _CommitFaultSession(AsyncSession):
+    async def commit(self) -> None:
+        plan = cast(_CommitFaultPlan, self.info["commit_fault_plan"])
+        plan.commit_calls += 1
+        mode = plan.mode
+        plan.mode = "disabled"
+        if mode == "before_commit":
+            plan.faulted_session_id = id(self)
+            raise RuntimeError("database-secret-before-commit")
+
+        await super().commit()
+        if mode == "after_commit":
+            plan.faulted_session_id = id(self)
+            raise RuntimeError("database-secret-after-commit")
+
+    async def rollback(self) -> None:
+        plan = cast(_CommitFaultPlan, self.info["commit_fault_plan"])
+        plan.rollback_calls += 1
+        await super().rollback()
+
+    async def close(self) -> None:
+        plan = cast(_CommitFaultPlan, self.info["commit_fault_plan"])
+        await super().close()
+        plan.closed_session_ids.add(id(self))
+
+
+def _commit_fault_session_factory(
+    engine: AsyncEngine,
+    plan: _CommitFaultPlan,
+) -> async_sessionmaker[AsyncSession]:
+    factory = async_sessionmaker(
+        bind=engine,
+        class_=_CommitFaultSession,
+        expire_on_commit=False,
+        autoflush=False,
+        info={"commit_fault_plan": plan},
+    )
+    return cast(async_sessionmaker[AsyncSession], factory)
+
+
 def test_postgres_block_indexer_range_resume_and_atomic_persistence() -> None:
     async def _test(engine: AsyncEngine) -> None:
         session_factory = create_session_factory(engine)
@@ -708,5 +766,131 @@ def test_postgres_block_indexer_concurrent_writers_reject_stale_bundle() -> None
             checkpoint = await reader.checkpoints.get_for_update()
             assert checkpoint is not None
             assert checkpoint.next_block_number == BlockNumber(block.number.value + 1)
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_block_indexer_reconciles_lost_commit_acknowledgement() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+        block = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, block.number.value)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(initial)
+            await setup.commit()
+
+        gateway = _IndexerGateway()
+        gateway.bundles[block.number] = BlockBundle(block, (transaction,))
+        fault_plan = _CommitFaultPlan(mode="after_commit")
+        fault_session_factory = _commit_fault_session_factory(engine, fault_plan)
+        indexer = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(fault_session_factory),
+        )
+
+        assert await indexer.index_range(block.number, block.number) == 1
+        assert fault_plan.commit_calls == 1
+        assert fault_plan.faulted_session_id is not None
+        assert fault_plan.faulted_session_id in fault_plan.closed_session_ids
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block.number) == block
+            assert await reader.transactions.get_by_hash(transaction.hash) == transaction
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == BlockNumber(block.number.value + 1)
+            assert checkpoint.expected_parent_hash == block.hash
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_block_indexer_stops_when_uncertain_commit_was_not_durable() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        initial = _checkpoint()
+        block = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, block.number.value)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(initial)
+            await setup.commit()
+
+        gateway = _IndexerGateway()
+        gateway.bundles[block.number] = BlockBundle(block, (transaction,))
+        fault_plan = _CommitFaultPlan(mode="before_commit")
+        fault_session_factory = _commit_fault_session_factory(engine, fault_plan)
+        indexer = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(fault_session_factory),
+        )
+
+        with pytest.raises(CommitNotDurableError, match="retry the same range"):
+            await indexer.index_range(block.number, block.number)
+        assert fault_plan.commit_calls == 1
+        assert fault_plan.rollback_calls >= 1
+        assert fault_plan.faulted_session_id is not None
+        assert fault_plan.faulted_session_id in fault_plan.closed_session_ids
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(block.number) is None
+            assert await reader.transactions.get_by_hash(transaction.hash) is None
+            assert await reader.checkpoints.get_for_update() == initial
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_startup_consistency_rejects_missing_checkpoint_tip() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        checkpoint = _checkpoint(next_block=21_000_001, expected_parent_hash=BLOCK_HASH_1)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(checkpoint)
+            await setup.commit()
+
+        with pytest.raises(IndexingConsistencyError, match=r"referenced.*missing"):
+            await BlockIndexer(
+                _IndexerGateway(),
+                lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+            ).index_range(BlockNumber(21_000_000), BlockNumber(21_000_000))
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_startup_consistency_rejects_block_beyond_checkpoint() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        tip = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        unexpected = _block(21_000_001, BLOCK_HASH_2, BLOCK_HASH_1)
+        checkpoint = _checkpoint(next_block=21_000_001, expected_parent_hash=BLOCK_HASH_1)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(checkpoint)
+            await setup.blocks.save(tip)
+            await setup.blocks.save(unexpected)
+            await setup.commit()
+
+        with pytest.raises(IndexingConsistencyError, match="beyond"):
+            await BlockIndexer(
+                _IndexerGateway(),
+                lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+            ).index_range(tip.number, tip.number)
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_startup_consistency_rejects_checkpoint_tip_hash_mismatch() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        tip = _block(21_000_000, BLOCK_HASH_1, PARENT_HASH_1)
+        checkpoint = _checkpoint(next_block=21_000_001, expected_parent_hash=BLOCK_HASH_2)
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            await setup.checkpoints.create(checkpoint)
+            await setup.blocks.save(tip)
+            await setup.commit()
+
+        with pytest.raises(IndexingConsistencyError, match="parent hash"):
+            await BlockIndexer(
+                _IndexerGateway(),
+                lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+            ).index_range(tip.number, tip.number)
 
     _run_with_postgres(_test)

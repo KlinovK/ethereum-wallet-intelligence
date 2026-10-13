@@ -12,6 +12,11 @@ _ENVIRONMENT_VARIABLES = (
     "EWI_APP_HOST",
     "EWI_APP_PORT",
     "ETHEREUM_RPC_URL",
+    "ETHEREUM_RPC_TIMEOUT_SECONDS",
+    "ETHEREUM_RPC_MAX_ATTEMPTS",
+    "ETHEREUM_RPC_RETRY_BASE_DELAY_SECONDS",
+    "ETHEREUM_RPC_RETRY_MAX_DELAY_SECONDS",
+    "ETHEREUM_RPC_RETRY_JITTER_RATIO",
     "DATABASE_URL",
 )
 
@@ -30,6 +35,11 @@ def test_settings_use_defaults() -> None:
     assert settings.app_host == "127.0.0.1"
     assert settings.app_port == 8000
     assert settings.ethereum_rpc_url is None
+    assert settings.ethereum_rpc_timeout_seconds == 10
+    assert settings.ethereum_rpc_max_attempts == 3
+    assert settings.ethereum_rpc_retry_base_delay_seconds == 0.25
+    assert settings.ethereum_rpc_retry_max_delay_seconds == 2
+    assert settings.ethereum_rpc_retry_jitter_ratio == 0.2
     assert settings.database_url is None
 
 
@@ -87,6 +97,39 @@ def test_settings_reject_invalid_rpc_url_without_exposing_credentials(
 
     assert "valid HTTP(S) URL" in str(error.value)
     assert "super-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ETHEREUM_RPC_TIMEOUT_SECONDS", "0"),
+        ("ETHEREUM_RPC_TIMEOUT_SECONDS", "61"),
+        ("ETHEREUM_RPC_MAX_ATTEMPTS", "0"),
+        ("ETHEREUM_RPC_MAX_ATTEMPTS", "6"),
+        ("ETHEREUM_RPC_RETRY_BASE_DELAY_SECONDS", "6"),
+        ("ETHEREUM_RPC_RETRY_MAX_DELAY_SECONDS", "31"),
+        ("ETHEREUM_RPC_RETRY_JITTER_RATIO", "1.1"),
+    ],
+)
+def test_settings_reject_unbounded_rpc_reliability_values(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_reject_retry_maximum_below_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ETHEREUM_RPC_RETRY_BASE_DELAY_SECONDS", "2")
+    monkeypatch.setenv("ETHEREUM_RPC_RETRY_MAX_DELAY_SECONDS", "1")
+
+    with pytest.raises(ValidationError, match="cannot be below"):
+        Settings()
 
 
 @pytest.mark.parametrize(

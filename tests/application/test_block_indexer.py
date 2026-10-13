@@ -15,8 +15,17 @@ from ethereum_wallet_intelligence.application import (
     BlockIndexer,
     BlockIndexingError,
     CheckpointConflictError,
+    CommitNotDurableError,
+    CommitOutcomeUnknownError,
+    CommitReconciliationError,
     IndexerCheckpoint,
+    IndexingConsistencyError,
+    InvalidBlockchainResponseError,
     InvalidBlockRangeError,
+    RpcRetryExhaustedError,
+    RpcRetryPolicy,
+    TransientBlockchainProviderError,
+    UnitOfWorkCleanupError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
@@ -74,6 +83,9 @@ class _FailurePlan:
     fail_on_transaction_save: int | None = None
     failure: BaseException | None = None
     transaction_save_calls: int = 0
+    commit_mode: str | None = None
+    cleanup_failure: bool = False
+    post_commit_mutator: Callable[[_MemoryState], None] | None = None
 
 
 class _MemoryBlockRepository:
@@ -85,6 +97,11 @@ class _MemoryBlockRepository:
 
     async def has_any(self) -> bool:
         return bool(self._state.blocks)
+
+    async def get_highest_number(self) -> BlockNumber | None:
+        if not self._state.blocks:
+            return None
+        return max(self._state.blocks, key=lambda number: number.value)
 
     async def save(self, block: Block) -> None:
         self._state.blocks[block.number] = block
@@ -107,6 +124,16 @@ class _MemoryTransactionRepository:
 
     async def has_any(self) -> bool:
         return bool(self._state.transactions)
+
+    async def get_by_block_number(
+        self,
+        block_number: BlockNumber,
+    ) -> tuple[Transaction, ...]:
+        return tuple(
+            transaction
+            for transaction in self._state.transactions.values()
+            if transaction.block_number == block_number
+        )
 
     async def save(self, transaction: Transaction) -> None:
         self._failure_plan.transaction_save_calls += 1
@@ -194,17 +221,33 @@ class _MemoryUnitOfWork:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        del exc_type, exc_value, traceback
+        del exc_type, traceback
         self._working = None
         self._blocks = None
         self._transactions = None
         self._checkpoints = None
+        if self._failure_plan.cleanup_failure and isinstance(
+            exc_value,
+            CommitOutcomeUnknownError,
+        ):
+            raise UnitOfWorkCleanupError("injected unconfirmed cleanup")
 
     async def commit(self) -> None:
         assert self._working is not None
+        commit_mode = self._failure_plan.commit_mode
+        self._failure_plan.commit_mode = None
+        if commit_mode == "not_durable":
+            raise CommitOutcomeUnknownError("injected lost commit acknowledgement")
+        if commit_mode == "checkpoint_only":
+            self._durable.checkpoint = self._working.checkpoint
+            raise CommitOutcomeUnknownError("injected partial durable state")
         self._durable.blocks = dict(self._working.blocks)
         self._durable.transactions = dict(self._working.transactions)
         self._durable.checkpoint = self._working.checkpoint
+        if self._failure_plan.post_commit_mutator is not None:
+            self._failure_plan.post_commit_mutator(self._durable)
+        if commit_mode == "ack_lost":
+            raise CommitOutcomeUnknownError("injected lost commit acknowledgement")
 
 
 class _MemoryUnitOfWorkFactory:
@@ -215,8 +258,10 @@ class _MemoryUnitOfWorkFactory:
     ) -> None:
         self.state = state or _MemoryState()
         self.failure_plan = failure_plan or _FailurePlan()
+        self.calls = 0
 
     def __call__(self) -> _MemoryUnitOfWork:
+        self.calls += 1
         return _MemoryUnitOfWork(self.state, self.failure_plan)
 
 
@@ -228,6 +273,7 @@ class _FakeBlockchainGateway:
         self.block_requests: list[BlockNumber] = []
         self.bundle_requests: list[BlockNumber] = []
         self.bundle_failure: BaseException | None = None
+        self.bundle_failures: list[BaseException] = []
         self.block_hook: Callable[[BlockNumber], None] | None = None
         self.bundle_hook: Callable[[BlockNumber], None] | None = None
 
@@ -245,6 +291,8 @@ class _FakeBlockchainGateway:
 
     async def get_block_with_transactions(self, number: BlockNumber) -> BlockBundle:
         self.bundle_requests.append(number)
+        if self.bundle_failures:
+            raise self.bundle_failures.pop(0)
         if self.bundle_failure is not None:
             raise self.bundle_failure
         bundle = self.bundles[number]
@@ -478,7 +526,11 @@ def test_existing_data_without_checkpoint_is_rejected_before_anchor_rpc() -> Non
 
 
 def test_resume_rejects_skips_and_treats_completed_range_as_no_op() -> None:
-    state = _MemoryState(checkpoint=_checkpoint(next_block=12, parent_hash=HASH_11))
+    tip = _block(11, HASH_11, HASH_10)
+    state = _MemoryState(
+        blocks={tip.number: tip},
+        checkpoint=_checkpoint(next_block=12, parent_hash=HASH_11),
+    )
     factory = _MemoryUnitOfWorkFactory(state)
     gateway = _FakeBlockchainGateway()
     indexer = BlockIndexer(gateway, factory)
@@ -572,3 +624,355 @@ def test_cancellation_during_transaction_save_rolls_back_bundle_and_checkpoint()
     assert state.blocks == {}
     assert state.transactions == {}
     assert state.checkpoint == _checkpoint()
+
+
+def test_transient_rpc_failures_retry_with_deterministic_exponential_backoff() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    gateway.bundles[block.number] = BlockBundle(block, ())
+    gateway.bundle_failures = [
+        TransientBlockchainProviderError("temporary failure"),
+        TransientBlockchainProviderError("temporary failure"),
+    ]
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    indexed = asyncio.run(
+        BlockIndexer(
+            gateway,
+            _MemoryUnitOfWorkFactory(state),
+            retry_policy=RpcRetryPolicy(
+                max_attempts=3,
+                base_delay_seconds=1,
+                max_delay_seconds=10,
+                jitter_ratio=0.5,
+            ),
+            sleep=record_sleep,
+            jitter=lambda: 0.5,
+        ).index_range(BlockNumber(10), BlockNumber(10))
+    )
+
+    assert indexed == 1
+    assert gateway.bundle_requests == [BlockNumber(10)] * 3
+    assert delays == [1.25, 2.5]
+
+
+def test_permanent_and_malformed_rpc_failures_are_not_retried() -> None:
+    for failure in (
+        BlockchainProviderError("permanent provider failure"),
+        InvalidBlockchainResponseError("malformed provider response"),
+    ):
+        gateway = _FakeBlockchainGateway()
+        gateway.bundle_failure = failure
+        sleeps: list[float] = []
+
+        async def record_sleep(delay: float, captured: list[float] = sleeps) -> None:
+            captured.append(delay)
+
+        with pytest.raises(type(failure)):
+            asyncio.run(
+                BlockIndexer(
+                    gateway,
+                    _MemoryUnitOfWorkFactory(_MemoryState(checkpoint=_checkpoint())),
+                    sleep=record_sleep,
+                ).index_range(BlockNumber(10), BlockNumber(10))
+            )
+
+        assert gateway.bundle_requests == [BlockNumber(10)]
+        assert sleeps == []
+
+
+def test_transient_rpc_retry_exhaustion_preserves_checkpoint() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    gateway = _FakeBlockchainGateway()
+    gateway.bundle_failure = TransientBlockchainProviderError("temporary failure")
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    with pytest.raises(RpcRetryExhaustedError, match="exhausted 3 attempts"):
+        asyncio.run(
+            BlockIndexer(
+                gateway,
+                _MemoryUnitOfWorkFactory(state),
+                retry_policy=RpcRetryPolicy(base_delay_seconds=0, max_delay_seconds=0),
+                sleep=no_wait,
+            ).index_range(BlockNumber(10), BlockNumber(10))
+        )
+
+    assert gateway.bundle_requests == [BlockNumber(10)] * 3
+    assert state.checkpoint == _checkpoint()
+    assert state.blocks == {}
+
+
+def test_cancellation_during_rpc_backoff_propagates_without_retrying() -> None:
+    gateway = _FakeBlockchainGateway()
+    gateway.bundle_failure = TransientBlockchainProviderError("temporary failure")
+
+    async def cancel_sleep(_: float) -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            BlockIndexer(
+                gateway,
+                _MemoryUnitOfWorkFactory(_MemoryState(checkpoint=_checkpoint())),
+                sleep=cancel_sleep,
+            ).index_range(BlockNumber(10), BlockNumber(10))
+        )
+
+    assert gateway.bundle_requests == [BlockNumber(10)]
+
+
+def test_lost_commit_acknowledgement_is_reconciled_from_fresh_state() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    failure_plan = _FailurePlan(commit_mode="ack_lost")
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    transaction = _transaction(10, "d1")
+    gateway.bundles[block.number] = BlockBundle(block, (transaction,))
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+            block.number,
+            block.number,
+        )
+    )
+
+    assert indexed == 1
+    assert state.blocks == {block.number: block}
+    assert state.transactions == {transaction.hash: transaction}
+    assert state.checkpoint == _checkpoint(next_block=11, parent_hash=HASH_10)
+
+
+def test_non_durable_uncertain_commit_stops_at_previous_checkpoint() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    failure_plan = _FailurePlan(commit_mode="not_durable")
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    gateway.bundles[block.number] = BlockBundle(block, ())
+
+    with pytest.raises(CommitNotDurableError, match="retry the same range"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+                block.number,
+                block.number,
+            )
+        )
+
+    assert state.blocks == {}
+    assert state.checkpoint == _checkpoint()
+
+
+def test_inconsistent_durable_commit_state_fails_closed() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    failure_plan = _FailurePlan(commit_mode="checkpoint_only")
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    gateway.bundles[block.number] = BlockBundle(block, ())
+
+    with pytest.raises(CommitReconciliationError, match="incomplete"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+                block.number,
+                block.number,
+            )
+        )
+
+    assert state.blocks == {}
+    assert state.checkpoint == _checkpoint(next_block=11, parent_hash=HASH_10)
+
+
+def test_reconciliation_rejects_extra_durable_transaction() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    extra = _transaction(10, "e2", nonce=2)
+
+    def add_extra_transaction(durable: _MemoryState) -> None:
+        durable.transactions[extra.hash] = extra
+
+    failure_plan = _FailurePlan(
+        commit_mode="ack_lost",
+        post_commit_mutator=add_extra_transaction,
+    )
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    expected = _transaction(10, "e1", nonce=1)
+    gateway.bundles[block.number] = BlockBundle(block, (expected,))
+
+    with pytest.raises(CommitReconciliationError, match="incomplete"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+                block.number,
+                block.number,
+            )
+        )
+
+
+def test_reconciliation_rejects_wrong_transaction_hash_with_same_count() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    replacement = _transaction(10, "f2", nonce=1)
+
+    def replace_transaction(durable: _MemoryState) -> None:
+        durable.transactions = {replacement.hash: replacement}
+
+    failure_plan = _FailurePlan(
+        commit_mode="ack_lost",
+        post_commit_mutator=replace_transaction,
+    )
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    expected = _transaction(10, "f1", nonce=1)
+    gateway.bundles[block.number] = BlockBundle(block, (expected,))
+
+    with pytest.raises(CommitReconciliationError, match="incomplete"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+                block.number,
+                block.number,
+            )
+        )
+
+
+def test_reconciliation_rejects_changed_transaction_content_with_same_hash() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    expected = _transaction(10, "a3", nonce=1)
+    changed = Transaction(
+        hash=expected.hash,
+        block_number=expected.block_number,
+        sender=expected.sender,
+        to=expected.to,
+        value=Wei(999),
+        nonce=expected.nonce,
+        gas_limit=expected.gas_limit,
+        input_data=expected.input_data,
+    )
+
+    def change_transaction(durable: _MemoryState) -> None:
+        durable.transactions = {changed.hash: changed}
+
+    failure_plan = _FailurePlan(
+        commit_mode="ack_lost",
+        post_commit_mutator=change_transaction,
+    )
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    gateway.bundles[block.number] = BlockBundle(block, (expected,))
+
+    with pytest.raises(CommitReconciliationError, match="incomplete"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+                block.number,
+                block.number,
+            )
+        )
+
+
+def test_reconciliation_rejects_checkpoint_advanced_beyond_intended_state() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+
+    def advance_checkpoint_again(durable: _MemoryState) -> None:
+        durable.checkpoint = _checkpoint(next_block=12, parent_hash=HASH_11)
+
+    failure_plan = _FailurePlan(
+        commit_mode="ack_lost",
+        post_commit_mutator=advance_checkpoint_again,
+    )
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    gateway.bundles[block.number] = BlockBundle(block, ())
+
+    with pytest.raises(CommitReconciliationError, match="cannot be reconciled"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, failure_plan)).index_range(
+                block.number,
+                block.number,
+            )
+        )
+
+
+def test_uncertain_checkpoint_initialization_reconciles_durable_creation() -> None:
+    failure_plan = _FailurePlan(commit_mode="ack_lost")
+    factory = _MemoryUnitOfWorkFactory(failure_plan=failure_plan)
+    gateway = _FakeBlockchainGateway()
+    blocks = _add_linear_blocks(gateway, 10, [HASH_10])
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, factory).index_range(BlockNumber(10), BlockNumber(10))
+    )
+
+    assert indexed == 1
+    assert factory.state.blocks == {blocks[0].number: blocks[0]}
+    assert factory.state.checkpoint == _checkpoint(next_block=11, parent_hash=HASH_10)
+
+
+def test_uncertain_checkpoint_initialization_stops_when_not_durable() -> None:
+    failure_plan = _FailurePlan(commit_mode="not_durable")
+    factory = _MemoryUnitOfWorkFactory(failure_plan=failure_plan)
+    gateway = _FakeBlockchainGateway()
+    _add_linear_blocks(gateway, 10, [HASH_10])
+
+    with pytest.raises(CommitNotDurableError, match="initialization was not durable"):
+        asyncio.run(BlockIndexer(gateway, factory).index_range(BlockNumber(10), BlockNumber(10)))
+
+    assert factory.state.checkpoint is None
+    assert gateway.bundle_requests == []
+
+
+def test_unconfirmed_cleanup_prevents_commit_reconciliation() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    failure_plan = _FailurePlan(commit_mode="not_durable", cleanup_failure=True)
+    factory = _MemoryUnitOfWorkFactory(state, failure_plan)
+    gateway = _FakeBlockchainGateway()
+    block = _block(10, HASH_10, HASH_9)
+    gateway.bundles[block.number] = BlockBundle(block, ())
+
+    with pytest.raises(UnitOfWorkCleanupError, match="unconfirmed cleanup"):
+        asyncio.run(BlockIndexer(gateway, factory).index_range(block.number, block.number))
+
+    assert factory.calls == 3
+    assert state.checkpoint == _checkpoint()
+
+
+def test_startup_consistency_rejects_missing_tip() -> None:
+    state = _MemoryState(checkpoint=_checkpoint(next_block=11, parent_hash=HASH_10))
+
+    with pytest.raises(IndexingConsistencyError, match=r"referenced.*missing"):
+        asyncio.run(
+            BlockIndexer(_FakeBlockchainGateway(), _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )
+
+
+def test_startup_consistency_rejects_blocks_beyond_checkpoint() -> None:
+    block_10 = _block(10, HASH_10, HASH_9)
+    block_11 = _block(11, HASH_11, HASH_10)
+    state = _MemoryState(
+        blocks={block_10.number: block_10, block_11.number: block_11},
+        checkpoint=_checkpoint(next_block=11, parent_hash=HASH_10),
+    )
+
+    with pytest.raises(IndexingConsistencyError, match="beyond"):
+        asyncio.run(
+            BlockIndexer(_FakeBlockchainGateway(), _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )
+
+
+def test_startup_consistency_rejects_broken_checkpoint_parent_hash() -> None:
+    block = _block(10, HASH_10, HASH_9)
+    state = _MemoryState(
+        blocks={block.number: block},
+        checkpoint=_checkpoint(next_block=11, parent_hash=WRONG_HASH),
+    )
+
+    with pytest.raises(IndexingConsistencyError, match="parent hash"):
+        asyncio.run(
+            BlockIndexer(_FakeBlockchainGateway(), _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )

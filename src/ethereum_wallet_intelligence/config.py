@@ -1,8 +1,9 @@
 """Application configuration."""
 
+from typing import Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,7 +26,44 @@ class Settings(BaseSettings):
     app_host: str = Field(default="127.0.0.1", min_length=1, validation_alias="EWI_APP_HOST")
     app_port: int = Field(default=8000, ge=1, le=65535, validation_alias="EWI_APP_PORT")
     ethereum_rpc_url: SecretStr | None = Field(default=None, validation_alias="ETHEREUM_RPC_URL")
+    ethereum_rpc_timeout_seconds: float = Field(
+        default=10.0,
+        ge=0.1,
+        le=60.0,
+        validation_alias="ETHEREUM_RPC_TIMEOUT_SECONDS",
+    )
+    ethereum_rpc_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        validation_alias="ETHEREUM_RPC_MAX_ATTEMPTS",
+    )
+    ethereum_rpc_retry_base_delay_seconds: float = Field(
+        default=0.25,
+        ge=0,
+        le=5,
+        validation_alias="ETHEREUM_RPC_RETRY_BASE_DELAY_SECONDS",
+    )
+    ethereum_rpc_retry_max_delay_seconds: float = Field(
+        default=2.0,
+        ge=0,
+        le=30,
+        validation_alias="ETHEREUM_RPC_RETRY_MAX_DELAY_SECONDS",
+    )
+    ethereum_rpc_retry_jitter_ratio: float = Field(
+        default=0.2,
+        ge=0,
+        le=1,
+        validation_alias="ETHEREUM_RPC_RETRY_JITTER_RATIO",
+    )
     database_url: SecretStr | None = Field(default=None, validation_alias="DATABASE_URL")
+
+    @model_validator(mode="after")
+    def validate_rpc_retry_delays(self) -> Self:
+        """Keep the maximum retry delay at or above its base delay."""
+        if self.ethereum_rpc_retry_max_delay_seconds < self.ethereum_rpc_retry_base_delay_seconds:
+            raise ValueError("Ethereum RPC retry maximum delay cannot be below its base delay")
+        return self
 
     @field_validator("ethereum_rpc_url")
     @classmethod

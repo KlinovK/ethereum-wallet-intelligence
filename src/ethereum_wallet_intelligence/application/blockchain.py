@@ -47,6 +47,18 @@ class BlockchainProviderError(RuntimeError):
     """Raised when the configured blockchain provider cannot fulfill a request."""
 
 
+class TransientBlockchainProviderError(BlockchainProviderError):
+    """Raised for a provider read failure that is safe to retry."""
+
+
+class PermanentBlockchainProviderError(BlockchainProviderError):
+    """Raised for a provider failure that must not be retried."""
+
+
+class InvalidBlockchainResponseError(PermanentBlockchainProviderError):
+    """Raised when a provider response cannot form valid application data."""
+
+
 class BlockchainGateway(Protocol):
     """Read-only blockchain operations required by the application."""
 

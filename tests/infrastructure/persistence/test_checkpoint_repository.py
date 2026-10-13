@@ -1,6 +1,7 @@
 """Unit tests for checkpoint persistence and the indexer Unit of Work."""
 
 import asyncio
+import traceback
 from datetime import UTC, datetime
 
 import pytest
@@ -9,8 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from ethereum_wallet_intelligence.application import (
     CheckpointConflictError,
     CheckpointRepository,
+    CommitOutcomeUnknownError,
     IndexerCheckpoint,
     IndexerUnitOfWork,
+    UnitOfWorkCleanupError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
@@ -269,6 +272,266 @@ def test_unit_of_work_cancellation_rolls_back_and_closes() -> None:
 
             async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
                 assert await reader.checkpoints.get_for_update() is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_classifies_commit_exception_as_outcome_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            session_factory = create_session_factory(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(session_factory)
+
+            with pytest.raises(CommitOutcomeUnknownError) as error:
+                async with unit_of_work:
+                    await unit_of_work.checkpoints.create(_checkpoint())
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_commit() -> None:
+                        raise RuntimeError(
+                            "postgresql://user:database-secret@database.example/indexer"
+                        )
+
+                    monkeypatch.setattr(session, "commit", fail_commit)
+                    await unit_of_work.commit()
+
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+            assert error.value.__cause__ is None
+            assert error.value.__context__ is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_rollback_failure_uses_invalidation_and_preserves_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            invalidated = False
+
+            with pytest.raises(CommitOutcomeUnknownError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+                    original_invalidate = session.invalidate
+
+                    async def fail_commit() -> None:
+                        raise RuntimeError("database-secret commit failure")
+
+                    async def fail_rollback() -> None:
+                        raise RuntimeError("database-secret rollback failure")
+
+                    async def record_invalidate() -> None:
+                        nonlocal invalidated
+                        invalidated = True
+                        await original_invalidate()
+
+                    monkeypatch.setattr(session, "commit", fail_commit)
+                    monkeypatch.setattr(session, "rollback", fail_rollback)
+                    monkeypatch.setattr(session, "invalidate", record_invalidate)
+                    await unit_of_work.commit()
+
+            assert invalidated is True
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_fails_closed_when_rollback_and_invalidation_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+
+            with pytest.raises(UnitOfWorkCleanupError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_commit() -> None:
+                        raise RuntimeError("database-secret commit failure")
+
+                    async def fail_rollback() -> None:
+                        raise RuntimeError("database-secret rollback failure")
+
+                    async def fail_invalidate() -> None:
+                        raise RuntimeError("database-secret invalidation failure")
+
+                    monkeypatch.setattr(session, "commit", fail_commit)
+                    monkeypatch.setattr(session, "rollback", fail_rollback)
+                    monkeypatch.setattr(session, "invalidate", fail_invalidate)
+                    await unit_of_work.commit()
+
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+            assert isinstance(error.value.__context__, CommitOutcomeUnknownError)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_close_failure_after_ambiguous_commit_preserves_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            invalidated = False
+
+            with pytest.raises(CommitOutcomeUnknownError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+                    original_commit = session.commit
+                    original_invalidate = session.invalidate
+
+                    async def commit_then_fail() -> None:
+                        await original_commit()
+                        raise RuntimeError("database-secret acknowledgment failure")
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def record_invalidate() -> None:
+                        nonlocal invalidated
+                        invalidated = True
+                        await original_invalidate()
+
+                    monkeypatch.setattr(session, "commit", commit_then_fail)
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", record_invalidate)
+                    await unit_of_work.commit()
+
+            assert invalidated is True
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_close_failure_invalidates_and_reports_cleanup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            invalidated = False
+
+            with pytest.raises(UnitOfWorkCleanupError, match="required connection invalidation"):
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+                    original_invalidate = session.invalidate
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def record_invalidate() -> None:
+                        nonlocal invalidated
+                        invalidated = True
+                        await original_invalidate()
+
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", record_invalidate)
+
+            assert invalidated is True
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_close_and_invalidation_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+
+            with pytest.raises(UnitOfWorkCleanupError, match="could not be confirmed"):
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def fail_invalidate() -> None:
+                        raise RuntimeError("database-secret invalidation failure")
+
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", fail_invalidate)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_cancellation_during_cleanup_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            await _create_schema(engine)
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            invalidated = False
+
+            with pytest.raises(asyncio.CancelledError):
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+                    original_invalidate = session.invalidate
+
+                    async def cancel_rollback() -> None:
+                        raise asyncio.CancelledError
+
+                    async def record_invalidate() -> None:
+                        nonlocal invalidated
+                        invalidated = True
+                        await original_invalidate()
+
+                    monkeypatch.setattr(session, "rollback", cancel_rollback)
+                    monkeypatch.setattr(session, "invalidate", record_invalidate)
+                    raise RuntimeError("primary failure")
+
+            assert invalidated is True
         finally:
             await engine.dispose()
 
