@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 import pytest
 
@@ -22,10 +22,15 @@ from ethereum_wallet_intelligence.application import (
     IndexingConsistencyError,
     InvalidBlockchainResponseError,
     InvalidBlockRangeError,
+    ReorganizationDepthExceededError,
+    ReorganizationPlanStaleError,
+    ReorganizationRangeError,
+    ReorganizationStartBoundaryError,
     RpcRetryExhaustedError,
     RpcRetryPolicy,
     TransientBlockchainProviderError,
     UnitOfWorkCleanupError,
+    UnstableCanonicalChainError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
@@ -86,11 +91,14 @@ class _FailurePlan:
     commit_mode: str | None = None
     cleanup_failure: bool = False
     post_commit_mutator: Callable[[_MemoryState], None] | None = None
+    delete_failure: BaseException | None = None
+    rewind_failure: BaseException | None = None
 
 
 class _MemoryBlockRepository:
-    def __init__(self, state: _MemoryState) -> None:
+    def __init__(self, state: _MemoryState, failure_plan: _FailurePlan) -> None:
         self._state = state
+        self._failure_plan = failure_plan
 
     async def get_by_number(self, block_number: BlockNumber) -> Block | None:
         return self._state.blocks.get(block_number)
@@ -107,10 +115,17 @@ class _MemoryBlockRepository:
         self._state.blocks[block.number] = block
 
     async def delete_after(self, block_number: BlockNumber) -> None:
+        if self._failure_plan.delete_failure is not None:
+            raise self._failure_plan.delete_failure
         self._state.blocks = {
             number: block
             for number, block in self._state.blocks.items()
             if number.value <= block_number.value
+        }
+        self._state.transactions = {
+            transaction_hash: transaction
+            for transaction_hash, transaction in self._state.transactions.items()
+            if transaction.block_number.value <= block_number.value
         }
 
 
@@ -144,8 +159,9 @@ class _MemoryTransactionRepository:
 
 
 class _MemoryCheckpointRepository:
-    def __init__(self, state: _MemoryState) -> None:
+    def __init__(self, state: _MemoryState, failure_plan: _FailurePlan) -> None:
         self._state = state
+        self._failure_plan = failure_plan
 
     async def get_for_update(self) -> IndexerCheckpoint | None:
         return self._state.checkpoint
@@ -176,7 +192,22 @@ class _MemoryCheckpointRepository:
         expected: IndexerCheckpoint,
         ancestor: Block,
     ) -> IndexerCheckpoint:
-        raise AssertionError("rewind is not used by BlockIndexer")
+        if self._failure_plan.rewind_failure is not None:
+            raise self._failure_plan.rewind_failure
+        if self._state.checkpoint != expected:
+            raise CheckpointConflictError("stale checkpoint")
+        if ancestor.number.value < expected.start_block_number.value:
+            raise CheckpointConflictError("ancestor precedes checkpoint start")
+        if self._state.blocks.get(ancestor.number) != ancestor:
+            raise CheckpointConflictError("ancestor is not persisted")
+        rewound = IndexerCheckpoint(
+            chain_id=expected.chain_id,
+            start_block_number=expected.start_block_number,
+            next_block_number=BlockNumber(ancestor.number.value + 1),
+            expected_parent_hash=ancestor.hash,
+        )
+        self._state.checkpoint = rewound
+        return rewound
 
 
 class _MemoryUnitOfWork:
@@ -210,9 +241,9 @@ class _MemoryUnitOfWork:
             checkpoint=self._durable.checkpoint,
         )
         self._working = working
-        self._blocks = _MemoryBlockRepository(working)
+        self._blocks = _MemoryBlockRepository(working, self._failure_plan)
         self._transactions = _MemoryTransactionRepository(working, self._failure_plan)
-        self._checkpoints = _MemoryCheckpointRepository(working)
+        self._checkpoints = _MemoryCheckpointRepository(working, self._failure_plan)
         return self
 
     async def __aexit__(
@@ -268,12 +299,15 @@ class _MemoryUnitOfWorkFactory:
 class _FakeBlockchainGateway:
     def __init__(self, chain_id: int = 1) -> None:
         self.chain_id = ChainId(chain_id)
-        self.blocks: dict[BlockNumber, Block] = {}
+        self.blocks: dict[BlockNumber, Block] = {BlockNumber(9): _block(9, HASH_9, WRONG_HASH)}
         self.bundles: dict[BlockNumber, BlockBundle] = {}
         self.block_requests: list[BlockNumber] = []
         self.bundle_requests: list[BlockNumber] = []
         self.bundle_failure: BaseException | None = None
         self.bundle_failures: list[BaseException] = []
+        self.block_failures: list[BaseException] = []
+        self.block_responses: dict[BlockNumber, list[Block]] = {}
+        self.bundle_responses: dict[BlockNumber, list[BlockBundle]] = {}
         self.block_hook: Callable[[BlockNumber], None] | None = None
         self.bundle_hook: Callable[[BlockNumber], None] | None = None
 
@@ -285,9 +319,23 @@ class _FakeBlockchainGateway:
 
     async def get_block(self, number: BlockNumber) -> Block:
         self.block_requests.append(number)
+        if self.block_failures:
+            raise self.block_failures.pop(0)
         if self.block_hook is not None:
             self.block_hook(number)
-        return self.blocks[number]
+        responses = self.block_responses.get(number)
+        if responses:
+            return responses.pop(0)
+        block = self.blocks.get(number)
+        if block is not None:
+            return block
+        bundle = self.bundles.get(number)
+        if bundle is not None and bundle.block.number == number:
+            return bundle.block
+        following = self.bundles.get(BlockNumber(number.value + 1))
+        if following is not None:
+            return _block(number.value, str(following.block.parent_hash), WRONG_HASH)
+        raise KeyError(number)
 
     async def get_block_with_transactions(self, number: BlockNumber) -> BlockBundle:
         self.bundle_requests.append(number)
@@ -295,7 +343,8 @@ class _FakeBlockchainGateway:
             raise self.bundle_failures.pop(0)
         if self.bundle_failure is not None:
             raise self.bundle_failure
-        bundle = self.bundles[number]
+        responses = self.bundle_responses.get(number)
+        bundle = responses.pop(0) if responses else self.bundles[number]
         if self.bundle_hook is not None:
             self.bundle_hook(number)
         return bundle
@@ -341,10 +390,49 @@ def _add_linear_blocks(
     for offset, block_hash in enumerate(hashes):
         number = start + offset
         block = _block(number, block_hash, parent_hash)
+        gateway.blocks[block.number] = block
         gateway.bundles[block.number] = BlockBundle(block=block, transactions=())
         blocks.append(block)
         parent_hash = block_hash
     return blocks
+
+
+def _numbered_hash(number: int, branch: int) -> str:
+    return f"0x{branch:02x}{number:062x}"
+
+
+def _chain(
+    start: int,
+    end: int,
+    *,
+    branch: int,
+    parent_hash: str,
+) -> list[Block]:
+    blocks: list[Block] = []
+    for number in range(start, end + 1):
+        block = _block(number, _numbered_hash(number, branch), parent_hash)
+        blocks.append(block)
+        parent_hash = str(block.hash)
+    return blocks
+
+
+def _indexed_state(start: int, blocks: list[Block]) -> _MemoryState:
+    tip = blocks[-1]
+    return _MemoryState(
+        blocks={block.number: block for block in blocks},
+        checkpoint=IndexerCheckpoint(
+            chain_id=ChainId.ethereum_mainnet(),
+            start_block_number=BlockNumber(start),
+            next_block_number=BlockNumber(tip.number.value + 1),
+            expected_parent_hash=tip.hash,
+        ),
+    )
+
+
+def _set_canonical_blocks(gateway: _FakeBlockchainGateway, blocks: list[Block]) -> None:
+    for block in blocks:
+        gateway.blocks[block.number] = block
+        gateway.bundles[block.number] = BlockBundle(block, ())
 
 
 @pytest.mark.parametrize(
@@ -398,7 +486,7 @@ def test_fresh_checkpoint_indexes_inclusive_empty_and_multi_transaction_blocks()
     )
 
     assert indexed == 2
-    assert gateway.block_requests == [BlockNumber(9)]
+    assert gateway.block_requests == [BlockNumber(9), BlockNumber(9), BlockNumber(11)]
     assert gateway.bundle_requests == [BlockNumber(10), BlockNumber(11)]
     assert factory.state.blocks == {block.number: block for block in blocks}
     assert tuple(factory.state.transactions.values()) == transactions
@@ -415,7 +503,7 @@ def test_genesis_initialization_uses_zero_parent_hash_without_anchor_request() -
     )
 
     assert indexed == 1
-    assert gateway.block_requests == []
+    assert gateway.block_requests == [BlockNumber(0)]
     assert factory.state.blocks == {BlockNumber(0): blocks[0]}
 
 
@@ -429,7 +517,8 @@ def test_checkpoint_initialization_adopts_safe_concurrent_winner() -> None:
     gateway.bundles[block.number] = BlockBundle(block, ())
 
     def initialize_competing_writer(_: BlockNumber) -> None:
-        state.checkpoint = _checkpoint()
+        if state.checkpoint is None:
+            state.checkpoint = _checkpoint()
 
     gateway.block_hook = initialize_competing_writer
 
@@ -533,6 +622,7 @@ def test_resume_rejects_skips_and_treats_completed_range_as_no_op() -> None:
     )
     factory = _MemoryUnitOfWorkFactory(state)
     gateway = _FakeBlockchainGateway()
+    gateway.blocks[tip.number] = tip
     indexer = BlockIndexer(gateway, factory)
 
     with pytest.raises(BlockIndexingError, match="skip unindexed"):
@@ -570,10 +660,11 @@ def test_wrong_parent_hash_halts_without_persistence() -> None:
         checkpoint=_checkpoint(next_block=11, parent_hash=HASH_10),
     )
     gateway = _FakeBlockchainGateway()
+    gateway.blocks[canonical.number] = canonical
     wrong = _block(11, HASH_11, WRONG_HASH)
     gateway.bundles[wrong.number] = BlockBundle(block=wrong, transactions=())
 
-    with pytest.raises(BlockIndexingError, match="possible reorganization"):
+    with pytest.raises(BlockIndexingError, match="does not extend its canonical tip"):
         asyncio.run(
             BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
                 BlockNumber(10), BlockNumber(11)
@@ -976,3 +1067,581 @@ def test_startup_consistency_rejects_broken_checkpoint_parent_hash() -> None:
                 BlockNumber(10), BlockNumber(10)
             )
         )
+
+
+def test_completed_range_verifies_matching_canonical_tip() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, local)
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(10), BlockNumber(11)
+        )
+    )
+
+    assert indexed == 0
+    assert gateway.block_requests == [BlockNumber(11)]
+    assert gateway.bundle_requests == []
+
+
+def test_startup_reorganization_rewinds_and_reindexes_canonical_block() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    canonical_11 = _block(11, _numbered_hash(11, 2), str(local[0].hash))
+    old_transaction = _transaction(11, "d0")
+    state = _indexed_state(10, local)
+    state.transactions[old_transaction.hash] = old_transaction
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, [local[0], canonical_11])
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(10), BlockNumber(11)
+        )
+    )
+
+    assert indexed == 1
+    assert state.blocks == {
+        local[0].number: local[0],
+        canonical_11.number: canonical_11,
+    }
+    assert state.transactions == {}
+    assert state.checkpoint == IndexerCheckpoint(
+        chain_id=ChainId.ethereum_mainnet(),
+        start_block_number=BlockNumber(10),
+        next_block_number=BlockNumber(12),
+        expected_parent_hash=canonical_11.hash,
+    )
+
+
+def test_completed_range_reorganization_is_recovered_without_new_indexing() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    canonical_11 = _block(11, _numbered_hash(11, 2), str(local[0].hash))
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, [local[0], canonical_11])
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(10), BlockNumber(10)
+        )
+    )
+
+    assert indexed == 0
+    assert set(state.blocks) == {BlockNumber(10)}
+    assert state.checkpoint is not None
+    assert state.checkpoint.next_block_number == BlockNumber(11)
+
+
+def test_parent_mismatch_after_tip_changes_triggers_recovery() -> None:
+    local = _chain(9, 10, branch=1, parent_hash=WRONG_HASH)
+    canonical_10 = _block(10, _numbered_hash(10, 2), str(local[0].hash))
+    canonical_11 = _block(11, _numbered_hash(11, 2), str(canonical_10.hash))
+    state = _indexed_state(9, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, [local[0], canonical_10, canonical_11])
+    gateway.block_responses[BlockNumber(10)] = [local[1], canonical_10]
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(9), BlockNumber(11)
+        )
+    )
+
+    assert indexed == 2
+    assert state.blocks[BlockNumber(10)] == canonical_10
+    assert state.blocks[BlockNumber(11)] == canonical_11
+
+
+def test_reorganization_can_rewind_exactly_sixty_four_blocks() -> None:
+    local = _chain(1, 100, branch=1, parent_hash=GENESIS_PARENT_HASH)
+    canonical = local[:36] + _chain(
+        37,
+        100,
+        branch=2,
+        parent_hash=str(local[35].hash),
+    )
+    state = _indexed_state(1, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, canonical)
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(1), BlockNumber(36)
+        )
+    )
+
+    assert indexed == 0
+    assert len(state.blocks) == 36
+    assert max(state.blocks, key=lambda number: number.value) == BlockNumber(36)
+    assert state.checkpoint is not None
+    assert state.checkpoint.next_block_number == BlockNumber(37)
+
+
+def test_reorganization_deeper_than_sixty_four_blocks_fails_closed() -> None:
+    local = _chain(1, 100, branch=1, parent_hash=GENESIS_PARENT_HASH)
+    canonical = local[:35] + _chain(
+        36,
+        100,
+        branch=2,
+        parent_hash=str(local[34].hash),
+    )
+    state = _indexed_state(1, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, canonical)
+
+    with pytest.raises(ReorganizationDepthExceededError, match="maximum 64-block"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(1), BlockNumber(100)
+            )
+        )
+
+    assert len(state.blocks) == 100
+    assert state.checkpoint == _indexed_state(1, local).checkpoint
+
+
+def test_reorganization_without_ancestor_above_start_boundary_fails_closed() -> None:
+    local = _chain(10, 12, branch=1, parent_hash=HASH_9)
+    canonical = _chain(10, 12, branch=2, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, canonical)
+
+    with pytest.raises(ReorganizationStartBoundaryError, match="start boundary"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(12)
+            )
+        )
+
+    assert state.blocks == {block.number: block for block in local}
+
+
+def test_unstarted_checkpoint_refuses_reorganization_before_original_start() -> None:
+    state = _MemoryState(checkpoint=_checkpoint())
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks[BlockNumber(9)] = _block(9, WRONG_HASH, GENESIS_PARENT_HASH)
+
+    with pytest.raises(ReorganizationStartBoundaryError, match="before the original"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )
+
+    assert state.checkpoint == _checkpoint()
+    assert state.blocks == {}
+
+
+def test_reorganization_rejects_incorrect_rpc_height() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks[BlockNumber(11)] = _block(12, HASH_12, HASH_11)
+
+    with pytest.raises(InvalidBlockchainResponseError, match="different block height"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(11)
+            )
+        )
+
+
+def test_reorganization_rejects_inconsistent_provider_ancestry() -> None:
+    local = _chain(10, 12, branch=1, parent_hash=HASH_9)
+    canonical_tip = _block(12, _numbered_hash(12, 2), _numbered_hash(11, 2))
+    inconsistent_11 = _block(11, _numbered_hash(11, 3), str(local[0].hash))
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks[canonical_tip.number] = canonical_tip
+    gateway.blocks[inconsistent_11.number] = inconsistent_11
+
+    with pytest.raises(UnstableCanonicalChainError, match="did not stabilize"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(12)
+            )
+        )
+
+    assert state.blocks == {block.number: block for block in local}
+
+
+def test_rpc_failure_during_ancestor_discovery_does_not_mutate_state() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    canonical_11 = _block(11, _numbered_hash(11, 2), str(local[0].hash))
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, [local[0], canonical_11])
+
+    def fail_ancestor(number: BlockNumber) -> None:
+        if number == BlockNumber(10):
+            raise BlockchainProviderError("safe test provider failure")
+
+    gateway.block_hook = fail_ancestor
+    with pytest.raises(BlockchainProviderError, match="safe test provider failure"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(11)
+            )
+        )
+
+    assert state.blocks == {block.number: block for block in local}
+
+
+def test_provider_changing_ancestor_during_discovery_exhausts_recovery_cycles() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    canonical_11 = _block(11, _numbered_hash(11, 2), str(local[0].hash))
+    changed_10 = _block(10, _numbered_hash(10, 3), HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks[canonical_11.number] = canonical_11
+    gateway.block_responses[BlockNumber(10)] = [
+        local[0],
+        changed_10,
+        local[0],
+        changed_10,
+        local[0],
+        changed_10,
+    ]
+
+    with pytest.raises(UnstableCanonicalChainError, match="did not stabilize"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(11)
+            )
+        )
+
+    assert gateway.block_requests.count(BlockNumber(10)) == 6
+    assert state.blocks == {block.number: block for block in local}
+
+
+def test_three_invocation_wide_recoveries_are_allowed_and_stabilize() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    common = local[0]
+    replacements = [
+        _block(11, _numbered_hash(11, branch), str(common.hash)) for branch in range(2, 5)
+    ]
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks.update({common.number: common, replacements[-1].number: replacements[-1]})
+    gateway.block_responses[BlockNumber(11)] = [*replacements, replacements[-1]]
+    gateway.bundle_responses[BlockNumber(11)] = [BlockBundle(block, ()) for block in replacements]
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(10), BlockNumber(11)
+        )
+    )
+
+    assert indexed == 3
+    assert gateway.bundle_requests == [BlockNumber(11)] * 3
+    assert state.blocks[BlockNumber(11)] == replacements[-1]
+    assert state.checkpoint is not None
+    assert state.checkpoint.expected_parent_hash == replacements[-1].hash
+
+
+def test_fourth_invocation_wide_recovery_is_rejected_before_database_mutation() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    common = local[0]
+    replacements = [
+        _block(11, _numbered_hash(11, branch), str(common.hash)) for branch in range(2, 6)
+    ]
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks.update({common.number: common, replacements[-1].number: replacements[-1]})
+    gateway.block_responses[BlockNumber(11)] = list(replacements)
+    gateway.bundle_responses[BlockNumber(11)] = [
+        BlockBundle(block, ()) for block in replacements[:-1]
+    ]
+
+    with pytest.raises(
+        UnstableCanonicalChainError,
+        match="invocation-wide limit of 3 recovery cycles",
+    ):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(11)
+            )
+        )
+
+    assert gateway.bundle_requests == [BlockNumber(11)] * 3
+    assert state.blocks[BlockNumber(11)] == replacements[-2]
+    assert state.checkpoint is not None
+    assert state.checkpoint.expected_parent_hash == replacements[-2].hash
+
+
+def test_provider_change_immediately_after_rewind_consumes_a_second_cycle() -> None:
+    local = _chain(9, 11, branch=1, parent_hash=WRONG_HASH)
+    replacement_11 = _block(11, _numbered_hash(11, 2), str(local[1].hash))
+    replacement_10 = _block(10, _numbered_hash(10, 3), str(local[0].hash))
+    state = _indexed_state(9, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks.update(
+        {
+            local[0].number: local[0],
+            replacement_10.number: replacement_10,
+            replacement_11.number: replacement_11,
+        }
+    )
+    gateway.block_responses[BlockNumber(10)] = [
+        local[1],
+        local[1],
+        replacement_10,
+    ]
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+            BlockNumber(9), BlockNumber(9)
+        )
+    )
+
+    assert indexed == 0
+    assert set(state.blocks) == {BlockNumber(9)}
+    assert state.checkpoint is not None
+    assert state.checkpoint.next_block_number == BlockNumber(10)
+
+
+def test_mid_index_and_completed_range_recovery_share_cycle_numbers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    local = _chain(9, 10, branch=1, parent_hash=WRONG_HASH)
+    common = local[0]
+    replacement_10 = _block(10, _numbered_hash(10, 2), str(common.hash))
+    replacement_11 = _block(11, _numbered_hash(11, 2), str(replacement_10.hash))
+    changed_11 = _block(11, _numbered_hash(11, 3), str(replacement_10.hash))
+    state = _indexed_state(9, local)
+    gateway = _FakeBlockchainGateway()
+    gateway.blocks.update(
+        {
+            common.number: common,
+            replacement_10.number: replacement_10,
+            changed_11.number: changed_11,
+        }
+    )
+    gateway.block_responses[BlockNumber(10)] = [local[1], replacement_10]
+    gateway.block_responses[BlockNumber(11)] = [changed_11, changed_11]
+    gateway.bundle_responses[BlockNumber(10)] = [BlockBundle(replacement_10, ())]
+    gateway.bundle_responses[BlockNumber(11)] = [
+        BlockBundle(replacement_11, ()),
+        BlockBundle(replacement_11, ()),
+        BlockBundle(changed_11, ()),
+    ]
+
+    with caplog.at_level("WARNING"):
+        indexed = asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(9), BlockNumber(11)
+            )
+        )
+
+    recovery_cycles = [
+        cast(int, record.__dict__["cycle"])
+        for record in caplog.records
+        if getattr(record, "event", None) == "reorganization_recovery_cycle"
+    ]
+    assert indexed == 3
+    assert recovery_cycles == [1, 2]
+    assert state.blocks[BlockNumber(11)] == changed_11
+
+
+def test_concurrent_checkpoint_change_rejects_stale_recovery_plan() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    canonical_11 = _block(11, _numbered_hash(11, 2), str(local[0].hash))
+    concurrent_12 = _block(12, HASH_12, str(local[1].hash))
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, [local[0], canonical_11])
+    ancestor_reads = 0
+
+    def advance_during_confirmation(number: BlockNumber) -> None:
+        nonlocal ancestor_reads
+        if number != BlockNumber(10):
+            return
+        ancestor_reads += 1
+        if ancestor_reads == 2:
+            state.blocks[concurrent_12.number] = concurrent_12
+            state.checkpoint = IndexerCheckpoint(
+                chain_id=ChainId.ethereum_mainnet(),
+                start_block_number=BlockNumber(10),
+                next_block_number=BlockNumber(13),
+                expected_parent_hash=concurrent_12.hash,
+            )
+
+    gateway.block_hook = advance_during_confirmation
+    with pytest.raises(ReorganizationPlanStaleError, match="changed during"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(10), BlockNumber(11)
+            )
+        )
+
+    assert state.blocks[BlockNumber(11)] == local[1]
+    assert state.blocks[BlockNumber(12)] == concurrent_12
+
+
+def test_cancellation_during_atomic_rewind_preserves_checkpoint_and_descendants() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(
+        gateway,
+        [local[0], _block(11, _numbered_hash(11, 2), str(local[0].hash))],
+    )
+    plan = _FailurePlan(rewind_failure=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, plan)).index_range(
+                BlockNumber(10), BlockNumber(11)
+            )
+        )
+
+    assert state.blocks == {block.number: block for block in local}
+    assert state.checkpoint == _indexed_state(10, local).checkpoint
+
+
+def test_ambiguous_rewind_commit_accepts_only_exact_durable_transition() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    transaction = _transaction(11, "e0")
+    state = _indexed_state(10, local)
+    state.transactions[transaction.hash] = transaction
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(
+        gateway,
+        [local[0], _block(11, _numbered_hash(11, 2), str(local[0].hash))],
+    )
+    plan = _FailurePlan(commit_mode="ack_lost")
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, plan)).index_range(
+            BlockNumber(10), BlockNumber(10)
+        )
+    )
+
+    assert indexed == 0
+    assert set(state.blocks) == {BlockNumber(10)}
+    assert state.transactions == {}
+
+
+def test_ambiguous_rewind_rejects_original_transaction_hash_moved_to_retained_block() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    original_transaction = _transaction(11, "e1")
+    moved_transaction = _transaction(10, "e1")
+    state = _indexed_state(10, local)
+    state.transactions[original_transaction.hash] = original_transaction
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(
+        gateway,
+        [local[0], _block(11, _numbered_hash(11, 2), str(local[0].hash))],
+    )
+
+    def retain_original_hash_elsewhere(durable: _MemoryState) -> None:
+        durable.transactions[moved_transaction.hash] = moved_transaction
+
+    plan = _FailurePlan(
+        commit_mode="ack_lost",
+        post_commit_mutator=retain_original_hash_elsewhere,
+    )
+
+    with pytest.raises(CommitReconciliationError, match="deletion is incomplete"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, plan)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )
+
+    assert not tuple(
+        transaction
+        for transaction in state.transactions.values()
+        if transaction.block_number == BlockNumber(11)
+    )
+    assert state.transactions[original_transaction.hash] == moved_transaction
+
+
+def test_proven_non_durable_rewind_restarts_fresh_discovery() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(
+        gateway,
+        [local[0], _block(11, _numbered_hash(11, 2), str(local[0].hash))],
+    )
+    plan = _FailurePlan(commit_mode="not_durable")
+
+    indexed = asyncio.run(
+        BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, plan)).index_range(
+            BlockNumber(10), BlockNumber(10)
+        )
+    )
+
+    assert indexed == 0
+    assert set(state.blocks) == {BlockNumber(10)}
+    assert gateway.block_requests.count(BlockNumber(11)) >= 2
+
+
+def test_partial_durable_rewind_state_fails_closed() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(
+        gateway,
+        [local[0], _block(11, _numbered_hash(11, 2), str(local[0].hash))],
+    )
+    plan = _FailurePlan(commit_mode="checkpoint_only")
+
+    with pytest.raises(CommitReconciliationError, match="deletion is incomplete"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, plan)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )
+
+    assert BlockNumber(11) in state.blocks
+    assert state.checkpoint is not None
+    assert state.checkpoint.next_block_number == BlockNumber(11)
+
+
+def test_cleanup_failure_prevents_rewind_commit_reconciliation() -> None:
+    local = _chain(10, 11, branch=1, parent_hash=HASH_9)
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(
+        gateway,
+        [local[0], _block(11, _numbered_hash(11, 2), str(local[0].hash))],
+    )
+    plan = _FailurePlan(commit_mode="not_durable", cleanup_failure=True)
+
+    with pytest.raises(UnitOfWorkCleanupError, match="unconfirmed cleanup"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state, plan)).index_range(
+                BlockNumber(10), BlockNumber(10)
+            )
+        )
+
+    assert state.blocks == {block.number: block for block in local}
+
+
+def test_rewind_below_requested_start_stops_with_operator_guidance() -> None:
+    local = _chain(10, 12, branch=1, parent_hash=HASH_9)
+    canonical = local[:1] + _chain(
+        11,
+        12,
+        branch=2,
+        parent_hash=str(local[0].hash),
+    )
+    state = _indexed_state(10, local)
+    gateway = _FakeBlockchainGateway()
+    _set_canonical_blocks(gateway, canonical)
+
+    with pytest.raises(ReorganizationRangeError, match="rerun with START=11"):
+        asyncio.run(
+            BlockIndexer(gateway, _MemoryUnitOfWorkFactory(state)).index_range(
+                BlockNumber(12), BlockNumber(12)
+            )
+        )
+
+    assert set(state.blocks) == {BlockNumber(10)}
+    assert state.checkpoint is not None
+    assert state.checkpoint.next_block_number == BlockNumber(11)

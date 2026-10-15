@@ -1,6 +1,7 @@
 """Application-facing ports and errors."""
 
 from ethereum_wallet_intelligence.application.block_indexer import (
+    MAX_REORGANIZATION_DEPTH,
     BlockIndexer,
     BlockIndexingError,
     ChainContinuityError,
@@ -8,8 +9,15 @@ from ethereum_wallet_intelligence.application.block_indexer import (
     CommitReconciliationError,
     IndexingConsistencyError,
     InvalidBlockRangeError,
+    ReorganizationDepthExceededError,
+    ReorganizationPlanStaleError,
+    ReorganizationRangeError,
+    ReorganizationRecoveryError,
+    ReorganizationStartBoundaryError,
+    RewindCommitNotDurableError,
     RpcRetryExhaustedError,
     RpcRetryPolicy,
+    UnstableCanonicalChainError,
 )
 from ethereum_wallet_intelligence.application.blockchain import (
     BlockBundle,
@@ -36,6 +44,7 @@ from ethereum_wallet_intelligence.application.unit_of_work import (
 )
 
 __all__ = [
+    "MAX_REORGANIZATION_DEPTH",
     "BlockBundle",
     "BlockIndexer",
     "BlockIndexingError",
@@ -57,9 +66,16 @@ __all__ = [
     "PermanentBlockchainProviderError",
     "PersistenceConflictError",
     "PersistenceError",
+    "ReorganizationDepthExceededError",
+    "ReorganizationPlanStaleError",
+    "ReorganizationRangeError",
+    "ReorganizationRecoveryError",
+    "ReorganizationStartBoundaryError",
+    "RewindCommitNotDurableError",
     "RpcRetryExhaustedError",
     "RpcRetryPolicy",
     "TransactionRepository",
     "TransientBlockchainProviderError",
     "UnitOfWorkCleanupError",
+    "UnstableCanonicalChainError",
 ]

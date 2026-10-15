@@ -9,6 +9,7 @@ from ethereum_wallet_intelligence.application import (
     CommitReconciliationError,
     IndexingConsistencyError,
     PermanentBlockchainProviderError,
+    ReorganizationDepthExceededError,
     RpcRetryExhaustedError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import BlockNumber
@@ -37,6 +38,7 @@ def test_index_cli_rejects_negative_block_number() -> None:
     [
         (RpcRetryExhaustedError("safe"), 3, "transient RPC exhausted"),
         (IndexingConsistencyError("safe"), 4, "consistency"),
+        (ReorganizationDepthExceededError("safe"), 4, "consistency"),
         (CommitReconciliationError("safe"), 5, "commit recovery"),
         (PermanentBlockchainProviderError("safe"), 6, "permanent RPC"),
     ],

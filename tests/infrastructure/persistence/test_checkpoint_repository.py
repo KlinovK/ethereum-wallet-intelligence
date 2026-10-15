@@ -1,11 +1,12 @@
 """Unit tests for checkpoint persistence and the indexer Unit of Work."""
 
 import asyncio
+import logging
 import traceback
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from ethereum_wallet_intelligence.application import (
     CheckpointConflictError,
@@ -532,6 +533,301 @@ def test_unit_of_work_cancellation_during_cleanup_propagates(
                     raise RuntimeError("primary failure")
 
             assert invalidated is True
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_primary_cancellation_survives_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            primary = asyncio.CancelledError("primary cancellation")
+            invalidated = False
+
+            with pytest.raises(asyncio.CancelledError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+                    original_invalidate = session.invalidate
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def record_invalidate() -> None:
+                        nonlocal invalidated
+                        invalidated = True
+                        await original_invalidate()
+
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", record_invalidate)
+                    raise primary
+
+            assert error.value is primary
+            assert invalidated is True
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_primary_cancellation_survives_invalidation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            primary = asyncio.CancelledError("primary cancellation")
+            close_called = False
+
+            with pytest.raises(asyncio.CancelledError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_rollback() -> None:
+                        raise RuntimeError("database-secret rollback failure")
+
+                    async def record_close() -> None:
+                        nonlocal close_called
+                        close_called = True
+
+                    async def fail_invalidate() -> None:
+                        raise RuntimeError("database-secret invalidation failure")
+
+                    monkeypatch.setattr(session, "rollback", fail_rollback)
+                    monkeypatch.setattr(session, "close", record_close)
+                    monkeypatch.setattr(session, "invalidate", fail_invalidate)
+                    raise primary
+
+            assert error.value is primary
+            assert close_called is False
+            assert error.value.__notes__ == [
+                "Database session cleanup could not be confirmed "
+                "(operation=exit, stage=rollback_failed, "
+                "invalidation_stage=invalidation_failed)"
+            ]
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_primary_cancellation_survives_close_and_invalidation_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            primary = asyncio.CancelledError("primary cancellation")
+
+            with (
+                caplog.at_level(
+                    logging.WARNING,
+                    logger=("ethereum_wallet_intelligence.infrastructure.persistence.unit_of_work"),
+                ),
+                pytest.raises(asyncio.CancelledError) as error,
+            ):
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def fail_invalidate() -> None:
+                        raise RuntimeError("database-secret invalidation failure")
+
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", fail_invalidate)
+                    raise primary
+
+            assert error.value is primary
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+            assert "database-secret" not in caplog.text
+            assert error.value.__cause__ is None
+            assert error.value.__context__ is None
+            unconfirmed = next(
+                record
+                for record in caplog.records
+                if getattr(record, "event", None) == "unit_of_work_cleanup_unconfirmed"
+            )
+            assert unconfirmed.__dict__["operation"] == "exit"
+            assert unconfirmed.__dict__["stage"] == "close_failed"
+            assert unconfirmed.__dict__["invalidation_stage"] == "invalidation_failed"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_cancellation_during_session_begin_survives_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            primary = asyncio.CancelledError("begin cancelled")
+            invalidation_attempted = False
+
+            async def cancel_begin(_: AsyncSession) -> None:
+                raise primary
+
+            async def fail_close(_: AsyncSession) -> None:
+                raise RuntimeError("database-secret close failure")
+
+            async def fail_invalidate(_: AsyncSession) -> None:
+                nonlocal invalidation_attempted
+                invalidation_attempted = True
+                raise RuntimeError("database-secret invalidation failure")
+
+            monkeypatch.setattr(AsyncSession, "begin", cancel_begin)
+            monkeypatch.setattr(AsyncSession, "close", fail_close)
+            monkeypatch.setattr(AsyncSession, "invalidate", fail_invalidate)
+
+            with pytest.raises(asyncio.CancelledError) as error:
+                await unit_of_work.__aenter__()
+
+            assert error.value is primary
+            assert invalidation_attempted is True
+            assert error.value.__notes__ == [
+                "Database session cleanup could not be confirmed "
+                "(operation=enter, stage=close_failed, "
+                "invalidation_stage=invalidation_failed)"
+            ]
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+            assert error.value.__cause__ is None
+            assert error.value.__context__ is None
+            with pytest.raises(RuntimeError, match="not active"):
+                _ = unit_of_work.blocks
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_cancellation_during_commit_remains_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            primary = asyncio.CancelledError("commit cancelled")
+
+            with pytest.raises(asyncio.CancelledError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def cancel_commit() -> None:
+                        raise primary
+
+                    monkeypatch.setattr(session, "commit", cancel_commit)
+                    await unit_of_work.commit()
+
+            assert error.value is primary
+            with pytest.raises(RuntimeError, match="not active"):
+                _ = unit_of_work.checkpoints
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_cancellation_during_invalidation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+            cleanup_cancellation = asyncio.CancelledError("invalidation cancelled")
+
+            with pytest.raises(asyncio.CancelledError) as error:
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def cancel_invalidation() -> None:
+                        raise cleanup_cancellation
+
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", cancel_invalidation)
+
+            assert error.value is cleanup_cancellation
+            assert error.value.__notes__ == [
+                "Database session cleanup could not be confirmed "
+                "(operation=exit, stage=close_failed, "
+                "invalidation_stage=invalidation_cancelled)"
+            ]
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_unit_of_work_ordinary_cleanup_failure_is_sanitized_and_observable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def _run() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            unit_of_work = SQLAlchemyIndexerUnitOfWork(create_session_factory(engine))
+
+            with (
+                caplog.at_level(
+                    logging.WARNING,
+                    logger=("ethereum_wallet_intelligence.infrastructure.persistence.unit_of_work"),
+                ),
+                pytest.raises(UnitOfWorkCleanupError) as error,
+            ):
+                async with unit_of_work:
+                    session = unit_of_work._session
+                    assert session is not None
+
+                    async def fail_close() -> None:
+                        raise RuntimeError("database-secret close failure")
+
+                    async def fail_invalidate() -> None:
+                        raise RuntimeError("database-secret invalidation failure")
+
+                    monkeypatch.setattr(session, "close", fail_close)
+                    monkeypatch.setattr(session, "invalidate", fail_invalidate)
+
+            rendered = "".join(
+                traceback.TracebackException.from_exception(error.value).format(chain=True)
+            )
+            assert "database-secret" not in rendered
+            assert "database-secret" not in caplog.text
+            assert error.value.__cause__ is None
+            assert error.value.__context__ is None
+            unconfirmed = next(
+                record
+                for record in caplog.records
+                if getattr(record, "event", None) == "unit_of_work_cleanup_unconfirmed"
+            )
+            assert unconfirmed.__dict__["operation"] == "exit"
+            assert unconfirmed.__dict__["stage"] == "close_failed"
+            assert unconfirmed.__dict__["invalidation_stage"] == "invalidation_failed"
         finally:
             await engine.dispose()
 

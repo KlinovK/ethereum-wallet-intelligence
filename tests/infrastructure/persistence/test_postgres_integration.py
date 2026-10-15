@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -29,6 +29,9 @@ from ethereum_wallet_intelligence.application import (
     IndexerCheckpoint,
     IndexingConsistencyError,
     PersistenceConflictError,
+    ReorganizationPlanStaleError,
+    UnitOfWorkCleanupError,
+    UnstableCanonicalChainError,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
     Block,
@@ -545,6 +548,10 @@ class _IndexerGateway:
         self.synchronize_bundle_reads = False
         self._bundle_read_count = 0
         self._bundle_read_barrier = asyncio.Event()
+        self.block_barrier_limits: dict[BlockNumber, int] = {}
+        self._block_read_counts: dict[BlockNumber, int] = {}
+        self._block_read_barriers: dict[tuple[BlockNumber, int], asyncio.Event] = {}
+        self.block_read_hook: Callable[[BlockNumber, int], Awaitable[None]] | None = None
 
     async def get_chain_id(self) -> ChainId:
         return ChainId.ethereum_mainnet()
@@ -554,10 +561,27 @@ class _IndexerGateway:
 
     async def get_block(self, number: BlockNumber) -> Block:
         self.block_requests.append(number)
-        try:
-            return self.blocks[number]
-        except KeyError as error:
-            raise BlockchainResourceNotFoundError("test block was not found") from error
+        limit = self.block_barrier_limits.get(number, 0)
+        count = self._block_read_counts.get(number, 0) + 1
+        self._block_read_counts[number] = count
+        if count <= limit:
+            pair = (count - 1) // 2
+            barrier = self._block_read_barriers.setdefault((number, pair), asyncio.Event())
+            if count % 2 == 0:
+                barrier.set()
+            await barrier.wait()
+        if self.block_read_hook is not None:
+            await self.block_read_hook(number, count)
+        block = self.blocks.get(number)
+        if block is not None:
+            return block
+        bundle = self.bundles.get(number)
+        if bundle is not None and bundle.block.number == number:
+            return bundle.block
+        following = self.bundles.get(BlockNumber(number.value + 1))
+        if following is not None:
+            return _block(number.value, str(following.block.parent_hash), PARENT_HASH_1)
+        raise BlockchainResourceNotFoundError("test block was not found")
 
     async def get_block_with_transactions(self, number: BlockNumber) -> BlockBundle:
         self.bundle_requests.append(number)
@@ -591,6 +615,9 @@ class _CommitFaultPlan:
     rollback_calls: int = 0
     faulted_session_id: int | None = None
     closed_session_ids: set[int] = field(default_factory=set)
+    close_failure: BaseException | None = None
+    invalidate_failure: BaseException | None = None
+    invalidate_calls: int = 0
 
 
 class _CommitFaultSession(AsyncSession):
@@ -598,8 +625,9 @@ class _CommitFaultSession(AsyncSession):
         plan = cast(_CommitFaultPlan, self.info["commit_fault_plan"])
         plan.commit_calls += 1
         mode = plan.mode
-        plan.mode = "disabled"
-        if mode == "before_commit":
+        if mode != "always_before_commit":
+            plan.mode = "disabled"
+        if mode in {"before_commit", "always_before_commit"}:
             plan.faulted_session_id = id(self)
             raise RuntimeError("database-secret-before-commit")
 
@@ -615,8 +643,17 @@ class _CommitFaultSession(AsyncSession):
 
     async def close(self) -> None:
         plan = cast(_CommitFaultPlan, self.info["commit_fault_plan"])
+        if plan.faulted_session_id == id(self) and plan.close_failure is not None:
+            raise plan.close_failure
         await super().close()
         plan.closed_session_ids.add(id(self))
+
+    async def invalidate(self) -> None:
+        plan = cast(_CommitFaultPlan, self.info["commit_fault_plan"])
+        plan.invalidate_calls += 1
+        if plan.faulted_session_id == id(self) and plan.invalidate_failure is not None:
+            raise plan.invalidate_failure
+        await super().invalidate()
 
 
 def _commit_fault_session_factory(
@@ -631,6 +668,46 @@ def _commit_fault_session_factory(
         info={"commit_fault_plan": plan},
     )
     return cast(async_sessionmaker[AsyncSession], factory)
+
+
+def _reorg_hash(number: int, branch: int) -> str:
+    return f"0x{branch:02x}{number:062x}"
+
+
+def _reorg_chain(
+    start: int,
+    end: int,
+    *,
+    branch: int,
+    parent_hash: str,
+) -> list[Block]:
+    blocks: list[Block] = []
+    for number in range(start, end + 1):
+        block = _block(number, _reorg_hash(number, branch), parent_hash)
+        blocks.append(block)
+        parent_hash = str(block.hash)
+    return blocks
+
+
+async def _persist_indexed_chain(
+    session_factory: async_sessionmaker[AsyncSession],
+    blocks: list[Block],
+    transactions: tuple[Transaction, ...] = (),
+) -> IndexerCheckpoint:
+    checkpoint = IndexerCheckpoint(
+        chain_id=ChainId.ethereum_mainnet(),
+        start_block_number=blocks[0].number,
+        next_block_number=BlockNumber(blocks[-1].number.value + 1),
+        expected_parent_hash=blocks[-1].hash,
+    )
+    async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+        for block in blocks:
+            await setup.blocks.save(block)
+        for transaction in transactions:
+            await setup.transactions.save(transaction)
+        await setup.checkpoints.create(checkpoint)
+        await setup.commit()
+    return checkpoint
 
 
 def test_postgres_block_indexer_range_resume_and_atomic_persistence() -> None:
@@ -658,7 +735,12 @@ def test_postgres_block_indexer_range_resume_and_atomic_persistence() -> None:
 
         assert indexed == 2
         assert already_complete == 0
-        assert gateway.block_requests == [anchor.number]
+        assert gateway.block_requests == [
+            anchor.number,
+            anchor.number,
+            block_2.number,
+            block_2.number,
+        ]
         assert gateway.bundle_requests == [block_1.number, block_2.number]
         async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
             assert await reader.blocks.get_by_number(block_1.number) == block_1
@@ -892,5 +974,408 @@ def test_postgres_startup_consistency_rejects_checkpoint_tip_hash_mismatch() -> 
                 _IndexerGateway(),
                 lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
             ).index_range(tip.number, tip.number)
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_completed_range_reorg_atomically_deletes_descendants_and_transactions() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_002, branch=1, parent_hash=PARENT_HASH_1)
+        transaction_1 = _transaction(TX_HASH_1, local[1].number.value)
+        transaction_2 = _transaction(TX_HASH_2, local[2].number.value)
+        await _persist_indexed_chain(
+            session_factory,
+            local,
+            (transaction_1, transaction_2),
+        )
+        canonical = [
+            local[0],
+            *_reorg_chain(
+                local[1].number.value,
+                local[2].number.value,
+                branch=2,
+                parent_hash=str(local[0].hash),
+            ),
+        ]
+        gateway = _IndexerGateway()
+        gateway.blocks.update({block.number: block for block in canonical})
+
+        indexed = await BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        ).index_range(local[0].number, local[0].number)
+
+        assert indexed == 0
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[0].number) == local[0]
+            assert await reader.blocks.get_by_number(local[1].number) is None
+            assert await reader.blocks.get_by_number(local[2].number) is None
+            assert await reader.transactions.get_by_hash(transaction_1.hash) is None
+            assert await reader.transactions.get_by_hash(transaction_2.hash) is None
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == local[1].number
+            assert checkpoint.expected_parent_hash == local[0].hash
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_rewind_reconciles_real_commit_acknowledgement_loss() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, local[1].number.value)
+        await _persist_indexed_chain(session_factory, local, (transaction,))
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+        fault_plan = _CommitFaultPlan(mode="after_commit")
+        fault_factory = _commit_fault_session_factory(engine, fault_plan)
+
+        indexed = await BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(fault_factory),
+        ).index_range(local[0].number, local[0].number)
+
+        assert indexed == 0
+        assert fault_plan.commit_calls == 1
+        assert fault_plan.faulted_session_id in fault_plan.closed_session_ids
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[1].number) is None
+            assert await reader.transactions.get_by_hash(transaction.hash) is None
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == local[1].number
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_rewind_before_commit_failures_roll_back_every_attempt() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        original = await _persist_indexed_chain(session_factory, local)
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+        fault_plan = _CommitFaultPlan(mode="always_before_commit")
+        fault_factory = _commit_fault_session_factory(engine, fault_plan)
+
+        with pytest.raises(UnstableCanonicalChainError, match="3 recovery cycles"):
+            await BlockIndexer(
+                gateway,
+                lambda: SQLAlchemyIndexerUnitOfWork(fault_factory),
+            ).index_range(local[0].number, local[0].number)
+
+        assert fault_plan.commit_calls == 3
+        assert fault_plan.rollback_calls >= 3
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[1].number) == local[1]
+            assert await reader.checkpoints.get_for_update() == original
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_concurrent_recovery_rejects_stale_writer() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        await _persist_indexed_chain(session_factory, local)
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+        gateway.block_barrier_limits = {
+            local[1].number: 2,
+            local[0].number: 4,
+        }
+        first = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        )
+        second = BlockIndexer(
+            gateway,
+            lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+        )
+
+        outcomes = await asyncio.gather(
+            first.index_range(local[0].number, local[0].number),
+            second.index_range(local[0].number, local[0].number),
+            return_exceptions=True,
+        )
+
+        assert outcomes.count(0) == 1
+        stale = [
+            outcome for outcome in outcomes if isinstance(outcome, ReorganizationPlanStaleError)
+        ]
+        assert len(stale) == 1
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[1].number) is None
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == local[1].number
+
+    _run_with_postgres(_test)
+
+
+@pytest.mark.parametrize("broken_history", ["missing", "mismatched"])
+def test_postgres_recovery_rejects_invalid_local_ancestor_history(
+    broken_history: str,
+) -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_002, branch=1, parent_hash=PARENT_HASH_1)
+        if broken_history == "missing":
+            persisted = [local[0], local[2]]
+        else:
+            persisted = [
+                local[0],
+                _block(local[1].number.value, str(local[1].hash), "0x" + "ff" * 32),
+                local[2],
+            ]
+        checkpoint = IndexerCheckpoint(
+            chain_id=ChainId.ethereum_mainnet(),
+            start_block_number=local[0].number,
+            next_block_number=BlockNumber(local[2].number.value + 1),
+            expected_parent_hash=local[2].hash,
+        )
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as setup:
+            for block in persisted:
+                await setup.blocks.save(block)
+            await setup.checkpoints.create(checkpoint)
+            await setup.commit()
+        canonical_tip = _block(
+            local[2].number.value,
+            _reorg_hash(local[2].number.value, 2),
+            _reorg_hash(local[1].number.value, 2),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks[canonical_tip.number] = canonical_tip
+
+        expected_message = "missing height" if broken_history == "missing" else "broken parent link"
+        with pytest.raises(IndexingConsistencyError, match=expected_message):
+            await BlockIndexer(
+                gateway,
+                lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+            ).index_range(local[0].number, local[2].number)
+
+    _run_with_postgres(_test)
+
+
+@pytest.mark.parametrize(
+    ("statement_fragment", "expected_trigger"),
+    [
+        ("DELETE FROM BLOCKS", "descendant deletion"),
+        ("UPDATE INDEXER_CHECKPOINT", "checkpoint rewind"),
+    ],
+)
+def test_postgres_cancellation_during_atomic_rewind_rolls_back_every_change(
+    statement_fragment: str,
+    expected_trigger: str,
+) -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, local[1].number.value)
+        original = await _persist_indexed_chain(session_factory, local, (transaction,))
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+        cancellation_triggered = False
+
+        def cancel_statement(
+            connection: object,
+            cursor: object,
+            statement: str,
+            parameters: object,
+            context: object,
+            executemany: bool,
+        ) -> None:
+            nonlocal cancellation_triggered
+            del connection, cursor, parameters, context, executemany
+            if statement_fragment in statement.upper():
+                cancellation_triggered = True
+                raise asyncio.CancelledError(expected_trigger)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", cancel_statement)
+        try:
+            with pytest.raises(asyncio.CancelledError, match=expected_trigger):
+                await BlockIndexer(
+                    gateway,
+                    lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+                ).index_range(local[0].number, local[0].number)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", cancel_statement)
+
+        assert cancellation_triggered
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[1].number) == local[1]
+            assert await reader.transactions.get_by_hash(transaction.hash) == transaction
+            assert await reader.checkpoints.get_for_update() == original
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_cancellation_during_ambiguous_rewind_cleanup_propagates() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        transaction = _transaction(TX_HASH_1, local[1].number.value)
+        await _persist_indexed_chain(session_factory, local, (transaction,))
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+        fault_plan = _CommitFaultPlan(
+            mode="after_commit",
+            close_failure=asyncio.CancelledError("cleanup cancelled"),
+        )
+        fault_factory = _commit_fault_session_factory(engine, fault_plan)
+
+        with pytest.raises(asyncio.CancelledError, match="cleanup cancelled"):
+            await BlockIndexer(
+                gateway,
+                lambda: SQLAlchemyIndexerUnitOfWork(fault_factory),
+            ).index_range(local[0].number, local[0].number)
+
+        assert fault_plan.commit_calls == 1
+        assert fault_plan.invalidate_calls == 1
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[1].number) is None
+            assert await reader.transactions.get_by_hash(transaction.hash) is None
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == local[1].number
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_cleanup_failure_blocks_rewind_reconciliation() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        await _persist_indexed_chain(session_factory, local)
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+        fault_plan = _CommitFaultPlan(
+            mode="after_commit",
+            close_failure=RuntimeError("database-secret-close"),
+            invalidate_failure=RuntimeError("database-secret-invalidate"),
+        )
+        fault_factory = _commit_fault_session_factory(engine, fault_plan)
+
+        with pytest.raises(UnitOfWorkCleanupError, match="cleanup could not be confirmed"):
+            await BlockIndexer(
+                gateway,
+                lambda: SQLAlchemyIndexerUnitOfWork(fault_factory),
+            ).index_range(local[0].number, local[0].number)
+
+        assert fault_plan.commit_calls == 1
+        assert fault_plan.invalidate_calls == 1
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[1].number) is None
+            checkpoint = await reader.checkpoints.get_for_update()
+            assert checkpoint is not None
+            assert checkpoint.next_block_number == local[1].number
+
+    _run_with_postgres(_test)
+
+
+def test_postgres_concurrent_ancestor_change_without_checkpoint_advance_is_stale() -> None:
+    async def _test(engine: AsyncEngine) -> None:
+        session_factory = create_session_factory(engine)
+        local = _reorg_chain(21_000_000, 21_000_001, branch=1, parent_hash=PARENT_HASH_1)
+        original = await _persist_indexed_chain(session_factory, local)
+        canonical_tip = _block(
+            local[1].number.value,
+            _reorg_hash(local[1].number.value, 2),
+            str(local[0].hash),
+        )
+        gateway = _IndexerGateway()
+        gateway.blocks.update(
+            {
+                local[0].number: local[0],
+                canonical_tip.number: canonical_tip,
+            }
+        )
+
+        async def change_ancestor_after_confirmation(number: BlockNumber, read_count: int) -> None:
+            if number != local[0].number or read_count != 2:
+                return
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE blocks SET timestamp = timestamp + INTERVAL '1 second' "
+                        "WHERE number = :number"
+                    ),
+                    {"number": number.value},
+                )
+
+        gateway.block_read_hook = change_ancestor_after_confirmation
+
+        with pytest.raises(ReorganizationPlanStaleError, match="ancestor changed"):
+            await BlockIndexer(
+                gateway,
+                lambda: SQLAlchemyIndexerUnitOfWork(session_factory),
+            ).index_range(local[0].number, local[0].number)
+
+        async with SQLAlchemyIndexerUnitOfWork(session_factory) as reader:
+            assert await reader.blocks.get_by_number(local[0].number) != local[0]
+            assert await reader.blocks.get_by_number(local[1].number) == local[1]
+            assert await reader.checkpoints.get_for_update() == original
 
     _run_with_postgres(_test)

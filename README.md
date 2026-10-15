@@ -6,8 +6,8 @@ transaction, token, DeFi, profit-and-loss, and wallet analytics.
 
 ## Current status
 
-Phase 6.5 hardens the bounded sequential block indexer against transient RPC failures and uncertain
-database commit acknowledgements. Indexing still runs only through an explicit operator command.
+Phase 6.6 adds bounded Ethereum reorganization recovery to the resilient sequential block indexer.
+Indexing still runs only through an explicit operator command.
 
 The service continues to expose the health endpoint:
 
@@ -44,16 +44,23 @@ one expected height and requires the exact block to have been persisted in the s
 PostgreSQL row locking plus full expected-state comparison rejects stale writers and prevents
 silent checkpoint overwrites.
 
-For a known canonical ancestor, a caller can lock the checkpoint, delete later blocks, and rewind
-the checkpoint in one Unit of Work. The transaction-to-block foreign key uses `ON DELETE CASCADE`,
-so transactions belonging to removed blocks cannot survive a committed rewind. A crash or failure
-before explicit commit leaves blocks, transactions, and checkpoint unchanged; after restart, work
-resumes from `next_block_number` without a skipped durable height.
+Before every invocation indexes new data—or returns an already-completed range—the indexer compares
+the persisted checkpoint tip with the same-height block from RPC. On divergence it searches backward
+for an exact locally persisted common ancestor, bounded to 64 blocks and never crossing the original
+checkpoint start. RPC discovery and ancestor confirmation happen without database locks. A fresh
+Unit of Work then locks and revalidates the checkpoint and affected blocks, deletes descendants, and
+rewinds the checkpoint in one transaction. The transaction-to-block foreign key uses
+`ON DELETE CASCADE`, so transactions belonging to removed blocks cannot survive a committed rewind.
 
-Current limitations are intentional: there is no continuously running indexer service, automatic
-reorganization rewind, finality policy, or database-write retry. One checkpoint row supports one
-Ethereum Mainnet indexing stream per database. Parent-hash mismatches halt indexing for operator
-investigation without deleting stored canonical data.
+Recovery rechecks the canonical tip after each rewind and permits at most three complete discovery
+cycles if provider history changes. If no verified ancestor exists within the bound, recovery would
+cross the original start, or a concurrent writer makes the plan stale, indexing fails closed. When a
+rewind moves `next_block_number` below the operator's requested `START`, the committed rewind is kept
+but indexing stops with the exact lower `START` required for the next manual invocation.
+
+Current limitations are intentional: there is no continuously running indexer service, finality
+policy, recovery deeper than 64 blocks, or database-write retry. One checkpoint row supports one
+Ethereum Mainnet indexing stream per database.
 
 ## Requirements
 
@@ -136,7 +143,8 @@ On a new database, the command anchors the checkpoint from `start - 1` (or the a
 for genesis) and refuses to initialize if block or transaction data already exists without a
 checkpoint. Subsequent invocations resume from the durable `next_block_number`; attempts to skip a
 height or cross the original start boundary fail explicitly. Already completed requested ranges
-are safe no-ops.
+still perform canonical-tip verification and may atomically recover a reorganization before
+returning without indexing new blocks.
 
 RPC fetching happens before opening the per-block database transaction. The checkpoint is then
 locked and revalidated before the block, all its transactions, and the checkpoint advancement are
@@ -164,11 +172,20 @@ Before fetching a block bundle, a read-only startup audit verifies the checkpoin
 expected parent hash, and absence of blocks beyond the checkpoint. It also continues to reject
 block or transaction data without a checkpoint. These checks do not repair or delete data.
 
+An ambiguous rewind commit is reconciled only after the old session is safely disposed. A fresh
+Unit of Work accepts success only when the exact rewound checkpoint and ancestor remain, while every
+snapshotted descendant and its transactions are absent. If the original checkpoint and full
+descendant snapshot remain unchanged, canonical discovery restarts from fresh RPC and database
+state; partial or advanced durable state fails closed.
+
 CLI failures include stable categories and exit codes: transient RPC exhaustion (`3`), durable
 state consistency (`4`), commit reconciliation (`5`), and permanent RPC failure (`6`); argument
-errors retain argparse's exit code (`2`). For a proven non-durable commit, rerun the identical
-range. For consistency, reconciliation, or parent-hash failures, stop indexing, preserve the
-database, and investigate the checkpoint and canonical chain before retrying. Credentials and
+errors retain argparse's exit code (`2`). For a proven non-durable block commit, rerun the identical
+range. For a successful rewind that stops below the requested range, rerun using the `START` reported
+in the error. For a reorganization deeper than 64 blocks, one that crosses the original start, an
+unstable provider history, or any consistency/reconciliation failure, stop indexing and investigate
+the provider and durable checkpoint before taking manual recovery action. Do not reset the
+checkpoint or delete data ad hoc. Credentials and
 connection strings are never included in indexer log fields or translated error messages. Provider
 and commit failures are translated after leaving the raw exception handler, so standard Python
 tracebacks do not retain the credential-bearing infrastructure exception as a cause or context.

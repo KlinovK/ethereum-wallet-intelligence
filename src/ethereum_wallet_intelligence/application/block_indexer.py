@@ -5,12 +5,14 @@ import logging
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from typing import NoReturn, TypeVar
 
 from ethereum_wallet_intelligence.application.blockchain import (
     BlockBundle,
     BlockchainGateway,
+    InvalidBlockchainResponseError,
     TransientBlockchainProviderError,
 )
 from ethereum_wallet_intelligence.application.indexing import IndexerCheckpoint
@@ -20,6 +22,7 @@ from ethereum_wallet_intelligence.application.unit_of_work import (
     IndexerUnitOfWork,
 )
 from ethereum_wallet_intelligence.domain.ethereum import (
+    Block,
     BlockHash,
     BlockNumber,
     ChainId,
@@ -27,6 +30,8 @@ from ethereum_wallet_intelligence.domain.ethereum import (
 )
 
 MAX_BLOCKS_PER_INVOCATION = 100
+MAX_REORGANIZATION_DEPTH = 64
+MAX_REORGANIZATION_RECOVERY_CYCLES = 3
 _GENESIS_PARENT_HASH = BlockHash("0x" + "00" * 32)
 _MAINNET_CHAIN_ID = ChainId.ethereum_mainnet()
 _ResultT = TypeVar("_ResultT")
@@ -58,6 +63,72 @@ class CommitReconciliationError(IndexingConsistencyError):
 
 class CommitNotDurableError(CommitReconciliationError):
     """Raised when reconciliation proves that an uncertain commit did not persist."""
+
+
+class ReorganizationRecoveryError(IndexingConsistencyError):
+    """Raised when a detected chain reorganization cannot be recovered safely."""
+
+
+class ReorganizationDepthExceededError(ReorganizationRecoveryError):
+    """Raised when no common ancestor exists within the automatic rewind bound."""
+
+
+class ReorganizationStartBoundaryError(ReorganizationRecoveryError):
+    """Raised when recovery would cross the original indexing start boundary."""
+
+
+class ReorganizationPlanStaleError(ReorganizationRecoveryError):
+    """Raised when durable state changes after a recovery plan is discovered."""
+
+
+class UnstableCanonicalChainError(ReorganizationRecoveryError):
+    """Raised when the provider chain does not stabilize during bounded recovery."""
+
+
+class ReorganizationRangeError(ReorganizationRecoveryError):
+    """Raised when recovery moves the checkpoint below the operator's requested range."""
+
+
+class RewindCommitNotDurableError(CommitNotDurableError):
+    """Raised when reconciliation proves that a rewind commit was not durable."""
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalChainSnapshot:
+    checkpoint: IndexerCheckpoint
+    blocks_descending: tuple[Block, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RewindSnapshot:
+    expected: IndexerCheckpoint
+    intended: IndexerCheckpoint
+    ancestor: Block
+    descendants: tuple[Block, ...]
+    descendant_transactions: tuple[tuple[BlockNumber, tuple[Transaction, ...]], ...]
+
+
+@dataclass(slots=True)
+class _ReorganizationRecoveryBudget:
+    """Invocation-wide allowance for complete reorganization recovery cycles.
+
+    A cycle begins after a canonical checkpoint mismatch is observed and before
+    discovery, rewind, or any other recovery action starts. Provider instability
+    and a proven non-durable rewind therefore consume the same finite allowance
+    as a successfully committed rewind.
+    """
+
+    cycles_started: int = 0
+
+    def begin_cycle(self) -> int:
+        if self.cycles_started >= MAX_REORGANIZATION_RECOVERY_CYCLES:
+            raise UnstableCanonicalChainError(
+                "Canonical Ethereum history did not stabilize within the "
+                f"invocation-wide limit of {MAX_REORGANIZATION_RECOVERY_CYCLES} "
+                "recovery cycles"
+            )
+        self.cycles_started += 1
+        return self.cycles_started
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,17 +188,50 @@ class BlockIndexer:
         checkpoint = await self._load_or_initialize_checkpoint(start, provider_chain_id)
         self._validate_checkpoint_for_request(checkpoint, provider_chain_id, start)
         await self._validate_startup_consistency(checkpoint)
+        recovery_budget = _ReorganizationRecoveryBudget()
+        checkpoint = await self._ensure_canonical_checkpoint(checkpoint, recovery_budget)
+        self._validate_request_after_recovery(checkpoint, start)
 
         indexed_blocks = 0
-        while checkpoint.next_block_number.value <= end.value:
+        canonical_verified = True
+        while True:
+            if checkpoint.next_block_number.value > end.value:
+                if canonical_verified:
+                    break
+                previous = checkpoint
+                checkpoint = await self._ensure_canonical_checkpoint(
+                    checkpoint,
+                    recovery_budget,
+                )
+                self._validate_request_after_recovery(checkpoint, start)
+                canonical_verified = True
+                if checkpoint != previous:
+                    continue
+                break
+
             requested_number = checkpoint.next_block_number
             bundle = await self._rpc_read(
                 "block_with_transactions",
                 partial(self._blockchain.get_block_with_transactions, requested_number),
             )
-            self._validate_bundle(bundle, checkpoint, requested_number)
+            self._validate_bundle_height(bundle, requested_number)
+            if bundle.block.parent_hash != checkpoint.expected_parent_hash:
+                self._log_reorganization_detected(checkpoint, "parent_mismatch")
+                previous = checkpoint
+                checkpoint = await self._ensure_canonical_checkpoint(
+                    checkpoint,
+                    recovery_budget,
+                )
+                self._validate_request_after_recovery(checkpoint, start)
+                if checkpoint == previous:
+                    raise UnstableCanonicalChainError(
+                        "Ethereum provider returned a block that does not extend its canonical tip"
+                    )
+                canonical_verified = True
+                continue
             checkpoint = await self._persist_bundle(bundle, checkpoint, provider_chain_id)
             indexed_blocks += 1
+            canonical_verified = False
 
         self._logger.info(
             "indexing_finished",
@@ -314,6 +418,339 @@ class BlockIndexer:
             raise ChainContinuityError(
                 "Block parent hash does not match the durable checkpoint; possible reorganization"
             )
+
+    @staticmethod
+    def _validate_bundle_height(bundle: BlockBundle, requested_number: BlockNumber) -> None:
+        if bundle.block.number != requested_number:
+            raise BlockIndexingError("Provider returned a different block height than requested")
+
+    def _validate_request_after_recovery(
+        self,
+        checkpoint: IndexerCheckpoint,
+        requested_start: BlockNumber,
+    ) -> None:
+        if requested_start.value > checkpoint.next_block_number.value:
+            raise ReorganizationRangeError(
+                "Reorganization recovery moved the checkpoint before the requested range; "
+                f"rerun with START={checkpoint.next_block_number.value}"
+            )
+
+    async def _ensure_canonical_checkpoint(
+        self,
+        checkpoint: IndexerCheckpoint,
+        recovery_budget: _ReorganizationRecoveryBudget,
+    ) -> IndexerCheckpoint:
+        current = checkpoint
+        while True:
+            canonical_tip = await self._get_canonical_checkpoint_tip(current)
+            if canonical_tip.hash == current.expected_parent_hash:
+                return current
+
+            self._log_reorganization_detected(current, "canonical_tip_mismatch")
+            cycle = recovery_budget.begin_cycle()
+            try:
+                local_snapshot = await self._snapshot_local_chain(current)
+                ancestor = await self._discover_common_ancestor(
+                    local_snapshot,
+                    canonical_tip,
+                )
+                confirmed_ancestor = await self._get_rpc_block(
+                    ancestor.number,
+                    "confirm the reorganization ancestor",
+                )
+                if confirmed_ancestor.hash != ancestor.hash:
+                    raise UnstableCanonicalChainError(
+                        "The canonical ancestor changed before reorganization recovery"
+                    )
+            except UnstableCanonicalChainError:
+                self._log_recovery_cycle(cycle, "provider_changed")
+                continue
+
+            try:
+                current = await self._apply_rewind(local_snapshot, ancestor)
+            except RewindCommitNotDurableError:
+                self._log_recovery_cycle(cycle, "rewind_not_durable")
+                durable = await self._inspect_checkpoint_state()
+                if durable != current:
+                    raise ReorganizationPlanStaleError(
+                        "Checkpoint changed after a non-durable rewind attempt"
+                    ) from None
+                continue
+
+            self._log_recovery_cycle(cycle, "rewound")
+            canonical_after_rewind = await self._get_canonical_checkpoint_tip(current)
+            if canonical_after_rewind.hash == current.expected_parent_hash:
+                return current
+
+    async def _get_canonical_checkpoint_tip(self, checkpoint: IndexerCheckpoint) -> Block:
+        if checkpoint.next_block_number == checkpoint.start_block_number:
+            if checkpoint.start_block_number.value == 0:
+                return Block(
+                    number=BlockNumber(0),
+                    hash=_GENESIS_PARENT_HASH,
+                    parent_hash=_GENESIS_PARENT_HASH,
+                    timestamp=datetime.fromtimestamp(0, tz=UTC),
+                )
+            tip_number = BlockNumber(checkpoint.start_block_number.value - 1)
+        else:
+            tip_number = BlockNumber(checkpoint.next_block_number.value - 1)
+        return await self._get_rpc_block(tip_number, "verify the canonical checkpoint tip")
+
+    async def _get_rpc_block(self, number: BlockNumber, operation: str) -> Block:
+        block = await self._rpc_read(
+            operation,
+            partial(self._blockchain.get_block, number),
+        )
+        if block.number != number:
+            raise InvalidBlockchainResponseError(
+                "Ethereum provider returned a different block height than requested"
+            )
+        return block
+
+    async def _snapshot_local_chain(
+        self,
+        expected: IndexerCheckpoint,
+    ) -> _LocalChainSnapshot:
+        if expected.next_block_number == expected.start_block_number:
+            raise ReorganizationStartBoundaryError(
+                "Canonical history changed before the original indexing start boundary"
+            )
+
+        tip_number = expected.next_block_number.value - 1
+        lowest_number = max(
+            expected.start_block_number.value,
+            tip_number - MAX_REORGANIZATION_DEPTH,
+        )
+        blocks: list[Block] = []
+        async with self._unit_of_work_factory() as unit_of_work:
+            durable = await unit_of_work.checkpoints.get_for_update()
+            if durable != expected:
+                raise ReorganizationPlanStaleError(
+                    "Checkpoint changed before reorganization discovery"
+                )
+            highest = await unit_of_work.blocks.get_highest_number()
+            if highest != BlockNumber(tip_number):
+                raise IndexingConsistencyError(
+                    "Persisted block tip changed before reorganization discovery"
+                )
+
+            higher: Block | None = None
+            for height in range(tip_number, lowest_number - 1, -1):
+                block = await unit_of_work.blocks.get_by_number(BlockNumber(height))
+                if block is None:
+                    raise IndexingConsistencyError(
+                        "Persisted block history contains a missing height"
+                    )
+                if higher is not None and higher.parent_hash != block.hash:
+                    raise IndexingConsistencyError(
+                        "Persisted block history contains a broken parent link"
+                    )
+                blocks.append(block)
+                higher = block
+
+        return _LocalChainSnapshot(expected, tuple(blocks))
+
+    async def _discover_common_ancestor(
+        self,
+        snapshot: _LocalChainSnapshot,
+        canonical_tip: Block,
+    ) -> Block:
+        local_tip = snapshot.blocks_descending[0]
+        if canonical_tip.number != local_tip.number:
+            raise InvalidBlockchainResponseError(
+                "Ethereum provider returned an incorrect canonical tip height"
+            )
+        if canonical_tip.hash == local_tip.hash:
+            return local_tip
+
+        canonical_higher = canonical_tip
+        for local_block in snapshot.blocks_descending[1:]:
+            canonical_block = await self._get_rpc_block(
+                local_block.number,
+                "discover a common canonical ancestor",
+            )
+            if canonical_higher.parent_hash != canonical_block.hash:
+                raise UnstableCanonicalChainError(
+                    "Ethereum provider returned an internally inconsistent block history"
+                )
+            if canonical_block.hash == local_block.hash:
+                return local_block
+            canonical_higher = canonical_block
+
+        lowest = snapshot.blocks_descending[-1]
+        if lowest.number == snapshot.checkpoint.start_block_number:
+            raise ReorganizationStartBoundaryError(
+                "No common ancestor exists at or above the original indexing start boundary"
+            )
+        raise ReorganizationDepthExceededError(
+            "No common ancestor exists within the maximum 64-block rewind depth"
+        )
+
+    async def _apply_rewind(
+        self,
+        discovered: _LocalChainSnapshot,
+        ancestor: Block,
+    ) -> IndexerCheckpoint:
+        expected = discovered.checkpoint
+        intended = IndexerCheckpoint(
+            chain_id=expected.chain_id,
+            start_block_number=expected.start_block_number,
+            next_block_number=BlockNumber(ancestor.number.value + 1),
+            expected_parent_hash=ancestor.hash,
+        )
+        rewind_snapshot: _RewindSnapshot | None = None
+        try:
+            async with self._unit_of_work_factory() as unit_of_work:
+                locked = await unit_of_work.checkpoints.get_for_update()
+                if locked != expected:
+                    raise ReorganizationPlanStaleError(
+                        "Checkpoint changed during reorganization discovery"
+                    )
+
+                persisted_ancestor = await unit_of_work.blocks.get_by_number(ancestor.number)
+                if persisted_ancestor != ancestor:
+                    raise ReorganizationPlanStaleError(
+                        "The discovered common ancestor changed before rewind"
+                    )
+
+                expected_descendants = tuple(
+                    block
+                    for block in reversed(discovered.blocks_descending)
+                    if block.number.value > ancestor.number.value
+                )
+                transactions: list[tuple[BlockNumber, tuple[Transaction, ...]]] = []
+                for block in expected_descendants:
+                    persisted = await unit_of_work.blocks.get_by_number(block.number)
+                    if persisted != block:
+                        raise ReorganizationPlanStaleError(
+                            "A reorganization descendant changed before rewind"
+                        )
+                    transactions.append(
+                        (
+                            block.number,
+                            await unit_of_work.transactions.get_by_block_number(block.number),
+                        )
+                    )
+
+                highest = await unit_of_work.blocks.get_highest_number()
+                expected_tip = BlockNumber(expected.next_block_number.value - 1)
+                if highest != expected_tip:
+                    raise ReorganizationPlanStaleError("Persisted block tip changed before rewind")
+
+                rewind_snapshot = _RewindSnapshot(
+                    expected=expected,
+                    intended=intended,
+                    ancestor=ancestor,
+                    descendants=expected_descendants,
+                    descendant_transactions=tuple(transactions),
+                )
+                await unit_of_work.blocks.delete_after(ancestor.number)
+                rewound = await unit_of_work.checkpoints.rewind(expected, ancestor)
+                if rewound != intended:
+                    raise IndexingConsistencyError(
+                        "Checkpoint repository returned an unexpected rewind transition"
+                    )
+                await unit_of_work.commit()
+                return rewound
+        except CommitOutcomeUnknownError:
+            assert rewind_snapshot is not None
+            return await self._reconcile_rewind_commit(rewind_snapshot)
+
+    async def _reconcile_rewind_commit(
+        self,
+        snapshot: _RewindSnapshot,
+    ) -> IndexerCheckpoint:
+        self._logger.warning(
+            "commit_reconciliation_started",
+            extra={"event": "commit_reconciliation_started", "operation": "checkpoint_rewind"},
+        )
+        async with self._unit_of_work_factory() as unit_of_work:
+            durable = await unit_of_work.checkpoints.get_for_update()
+            ancestor = await unit_of_work.blocks.get_by_number(snapshot.ancestor.number)
+            highest = await unit_of_work.blocks.get_highest_number()
+
+            if durable == snapshot.intended:
+                descendants_absent = True
+                for block in snapshot.descendants:
+                    if await unit_of_work.blocks.get_by_number(block.number) is not None:
+                        descendants_absent = False
+                        break
+                deleted_height_transactions_absent = True
+                for number, _ in snapshot.descendant_transactions:
+                    if await unit_of_work.transactions.get_by_block_number(number):
+                        deleted_height_transactions_absent = False
+                original_transaction_hashes_absent = True
+                for _, transactions in snapshot.descendant_transactions:
+                    for transaction in transactions:
+                        if (
+                            await unit_of_work.transactions.get_by_hash(transaction.hash)
+                            is not None
+                        ):
+                            original_transaction_hashes_absent = False
+                if (
+                    ancestor == snapshot.ancestor
+                    and highest == snapshot.ancestor.number
+                    and descendants_absent
+                    and deleted_height_transactions_absent
+                    and original_transaction_hashes_absent
+                ):
+                    self._log_reconciliation("committed", "checkpoint_rewind")
+                    return snapshot.intended
+                self._log_reconciliation("inconsistent", "checkpoint_rewind")
+                raise CommitReconciliationError(
+                    "Checkpoint rewound but descendant deletion is incomplete"
+                )
+
+            if durable == snapshot.expected:
+                original_tip = BlockNumber(snapshot.expected.next_block_number.value - 1)
+                descendants_unchanged = True
+                for block in snapshot.descendants:
+                    if await unit_of_work.blocks.get_by_number(block.number) != block:
+                        descendants_unchanged = False
+                        break
+                transactions_unchanged = True
+                for number, transactions in snapshot.descendant_transactions:
+                    if await unit_of_work.transactions.get_by_block_number(number) != transactions:
+                        transactions_unchanged = False
+                        break
+                if (
+                    ancestor == snapshot.ancestor
+                    and highest == original_tip
+                    and descendants_unchanged
+                    and transactions_unchanged
+                ):
+                    self._log_reconciliation("not_durable", "checkpoint_rewind")
+                    raise RewindCommitNotDurableError(
+                        "Checkpoint rewind was not durable; canonical discovery must restart"
+                    )
+
+            self._log_reconciliation("inconsistent", "checkpoint_rewind")
+            raise CommitReconciliationError("Checkpoint rewind commit left ambiguous durable state")
+
+    def _log_reorganization_detected(
+        self,
+        checkpoint: IndexerCheckpoint,
+        reason: str,
+    ) -> None:
+        self._logger.warning(
+            "reorganization_detected",
+            extra={
+                "event": "reorganization_detected",
+                "reason": reason,
+                "next_block": checkpoint.next_block_number.value,
+            },
+        )
+
+    def _log_recovery_cycle(self, cycle: int, outcome: str) -> None:
+        self._logger.warning(
+            "reorganization_recovery_cycle",
+            extra={
+                "event": "reorganization_recovery_cycle",
+                "cycle": cycle,
+                "max_cycles": MAX_REORGANIZATION_RECOVERY_CYCLES,
+                "outcome": outcome,
+            },
+        )
 
     async def _persist_bundle(
         self,

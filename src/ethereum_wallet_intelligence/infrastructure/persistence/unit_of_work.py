@@ -20,6 +20,89 @@ from ethereum_wallet_intelligence.infrastructure.persistence.repositories import
 _logger = logging.getLogger(__name__)
 
 
+async def _dispose_session(
+    session: AsyncSession,
+    *,
+    operation: str,
+    cancellation: CancelledError | None,
+) -> tuple[bool, str | None, CancelledError | None]:
+    """Release a session while retaining the earliest cancellation signal."""
+    cleanup_stage: str | None = None
+    invalidation_stage: str | None = None
+    disposal_confirmed = False
+
+    try:
+        if session.in_transaction():
+            await session.rollback()
+    except CancelledError as error:
+        if cancellation is None:
+            cancellation = error
+        cleanup_stage = "rollback_cancelled"
+    except Exception:
+        cleanup_stage = "rollback_failed"
+
+    if cleanup_stage is None:
+        try:
+            await session.close()
+            disposal_confirmed = True
+        except CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            cleanup_stage = "close_cancelled"
+        except Exception:
+            cleanup_stage = "close_failed"
+
+    if cleanup_stage is not None:
+        _logger.warning(
+            "unit_of_work_cleanup_recovery_started",
+            extra={
+                "event": "unit_of_work_cleanup_recovery_started",
+                "operation": operation,
+                "stage": cleanup_stage,
+            },
+        )
+        try:
+            await session.invalidate()
+            disposal_confirmed = True
+            invalidation_stage = "invalidation_succeeded"
+        except CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            invalidation_stage = "invalidation_cancelled"
+        except Exception:
+            invalidation_stage = "invalidation_failed"
+
+    if not disposal_confirmed:
+        safe_invalidation_stage = invalidation_stage or "invalidation_not_attempted"
+        _logger.error(
+            "unit_of_work_cleanup_unconfirmed",
+            extra={
+                "event": "unit_of_work_cleanup_unconfirmed",
+                "operation": operation,
+                "stage": cleanup_stage or "cleanup_unknown",
+                "invalidation_stage": safe_invalidation_stage,
+            },
+        )
+        if cancellation is not None:
+            cancellation.add_note(
+                "Database session cleanup could not be confirmed "
+                f"(operation={operation}, stage={cleanup_stage or 'cleanup_unknown'}, "
+                f"invalidation_stage={safe_invalidation_stage})"
+            )
+    elif cleanup_stage is not None:
+        _logger.warning(
+            "unit_of_work_cleanup_recovered",
+            extra={
+                "event": "unit_of_work_cleanup_recovered",
+                "operation": operation,
+                "stage": cleanup_stage,
+                "invalidation_stage": invalidation_stage,
+            },
+        )
+
+    return disposal_confirmed, cleanup_stage, cancellation
+
+
 class SQLAlchemyIndexerUnitOfWork:
     """Own one session and transaction shared by all indexing repositories."""
 
@@ -59,16 +142,29 @@ class SQLAlchemyIndexerUnitOfWork:
         session = self._session_factory()
         try:
             await session.begin()
-        except BaseException:
-            await session.close()
-            raise
+        except BaseException as error:
+            primary_error = error
+        else:
+            self._session = session
+            self._blocks = SQLAlchemyBlockRepository(session)
+            self._transactions = SQLAlchemyTransactionRepository(session)
+            self._checkpoints = SQLAlchemyCheckpointRepository(session)
+            self._committed = False
+            return self
 
-        self._session = session
-        self._blocks = SQLAlchemyBlockRepository(session)
-        self._transactions = SQLAlchemyTransactionRepository(session)
-        self._checkpoints = SQLAlchemyCheckpointRepository(session)
-        self._committed = False
-        return self
+        primary_cancellation = primary_error if isinstance(primary_error, CancelledError) else None
+        disposal_confirmed, _, cancellation = await _dispose_session(
+            session,
+            operation="enter",
+            cancellation=primary_cancellation,
+        )
+        if cancellation is not None:
+            raise cancellation
+        if not disposal_confirmed:
+            raise UnitOfWorkCleanupError(
+                "Database session cleanup could not be confirmed; indexing stopped safely"
+            )
+        raise primary_error
 
     async def __aexit__(
         self,
@@ -81,44 +177,13 @@ class SQLAlchemyIndexerUnitOfWork:
         if session is None:
             return
 
-        cleanup_stage: str | None = None
-        cancellation: CancelledError | None = None
-        disposal_confirmed = False
+        primary_cancellation = exc_value if isinstance(exc_value, CancelledError) else None
         try:
-            try:
-                if session.in_transaction():
-                    await session.rollback()
-            except CancelledError as error:
-                cancellation = error
-                cleanup_stage = "rollback_cancelled"
-            except Exception:
-                cleanup_stage = "rollback_failed"
-
-            if cleanup_stage is None:
-                try:
-                    await session.close()
-                    disposal_confirmed = True
-                except CancelledError as error:
-                    cancellation = error
-                    cleanup_stage = "close_cancelled"
-                except Exception:
-                    cleanup_stage = "close_failed"
-
-            if cleanup_stage is not None:
-                _logger.warning(
-                    "unit_of_work_cleanup_recovery_started",
-                    extra={
-                        "event": "unit_of_work_cleanup_recovery_started",
-                        "stage": cleanup_stage,
-                    },
-                )
-                try:
-                    await session.invalidate()
-                    disposal_confirmed = True
-                except CancelledError as error:
-                    cancellation = error
-                except Exception:
-                    disposal_confirmed = False
+            disposal_confirmed, cleanup_stage, cancellation = await _dispose_session(
+                session,
+                operation="exit",
+                cancellation=primary_cancellation,
+            )
         finally:
             self._session = None
             self._blocks = None
@@ -127,11 +192,6 @@ class SQLAlchemyIndexerUnitOfWork:
             self._committed = False
 
         if cancellation is not None:
-            if not disposal_confirmed:
-                _logger.error(
-                    "unit_of_work_cleanup_unconfirmed",
-                    extra={"event": "unit_of_work_cleanup_unconfirmed"},
-                )
             raise cancellation
 
         if not disposal_confirmed:
@@ -139,15 +199,10 @@ class SQLAlchemyIndexerUnitOfWork:
                 "Database session cleanup could not be confirmed; indexing stopped safely"
             )
 
-        if cleanup_stage is not None:
-            _logger.warning(
-                "unit_of_work_cleanup_recovered",
-                extra={"event": "unit_of_work_cleanup_recovered", "stage": cleanup_stage},
+        if cleanup_stage is not None and exc_value is None:
+            raise UnitOfWorkCleanupError(
+                "Database session cleanup required connection invalidation"
             )
-            if exc_value is None:
-                raise UnitOfWorkCleanupError(
-                    "Database session cleanup required connection invalidation"
-                )
 
     async def commit(self) -> None:
         """Commit the active transaction exactly once."""
