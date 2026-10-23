@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     LargeBinary,
     Numeric,
     SmallInteger,
@@ -74,6 +75,21 @@ class TransactionModel(Base):
     nonce: Mapped[int] = mapped_column(BigInteger, nullable=False)
     gas_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
     input: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+
+Index(
+    "ix_transactions_sender_activity_keyset",
+    TransactionModel.sender,
+    TransactionModel.block_number.desc(),
+    TransactionModel.hash.collate("C").desc(),
+).ddl_if(dialect="postgresql")
+Index(
+    "ix_transactions_recipient_activity_keyset",
+    TransactionModel.recipient,
+    TransactionModel.block_number.desc(),
+    TransactionModel.hash.collate("C").desc(),
+    postgresql_where=TransactionModel.recipient.is_not(None),
+).ddl_if(dialect="postgresql")
 
 
 class IndexerCheckpointModel(Base):

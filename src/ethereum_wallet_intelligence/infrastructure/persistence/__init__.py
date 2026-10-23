@@ -26,6 +26,9 @@ from ethereum_wallet_intelligence.infrastructure.persistence.repositories import
 from ethereum_wallet_intelligence.infrastructure.persistence.unit_of_work import (
     SQLAlchemyIndexerUnitOfWork,
 )
+from ethereum_wallet_intelligence.infrastructure.persistence.wallet_activity_reader import (
+    SQLAlchemyWalletActivityReader,
+)
 
 __all__ = [
     "Base",
@@ -35,6 +38,7 @@ __all__ = [
     "SQLAlchemyCheckpointRepository",
     "SQLAlchemyIndexerUnitOfWork",
     "SQLAlchemyTransactionRepository",
+    "SQLAlchemyWalletActivityReader",
     "TransactionModel",
     "block_to_domain",
     "block_to_model",
